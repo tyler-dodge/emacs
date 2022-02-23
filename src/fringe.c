@@ -602,13 +602,21 @@ draw_fringe_bitmap_1 (struct window *w, struct glyph_row *row, int left_p, int o
       offset = row->right_fringe_offset;
     }
 
+  enum face_id fringe_face = FRINGE_FACE_ID;
+  Lisp_Object fringe_sym = Qfringe;
+
+  if (w == XWINDOW(selected_window)) {
+    fringe_face = FRINGE_ACTIVE_FACE_ID;
+    fringe_sym = Qfringe_active;
+  }
+
   if (face_id == DEFAULT_FACE_ID)
     {
       Lisp_Object face = fringe_faces[which];
-      face_id = NILP (face) ? lookup_named_face (w, f, Qfringe, false)
-	: lookup_derived_face (w, f, face, FRINGE_FACE_ID, 0);
+      face_id = NILP (face) ? lookup_named_face (w, f, fringe_sym, false)
+	: lookup_derived_face (w, f, face, fringe_face, 0);
       if (face_id < 0)
-	face_id = FRINGE_FACE_ID;
+	face_id = fringe_face;
     }
 
   fb = get_fringe_bitmap_data (which);

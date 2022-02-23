@@ -93,7 +93,7 @@ the default storage location, e.g. \"$HOME/.sh_history\"."
 
 (defvar tramp-end-of-output
   (format
-   "///%s#$"
+   "///%s#$ "
    (md5 (concat (prin1-to-string process-environment) (current-time-string))))
   "String used to recognize end of output.
 The `$' character at the end is quoted; the string cannot be
@@ -2889,6 +2889,10 @@ the result will be a local, non-Tramp, file name."
 
 ;;; Remote commands:
 
+(defun dece-tramp-filter (delegate)
+  (lambda (proc string)
+    (ansi-color-for-comint-mode-filter proc string)))
+
 ;; We use BUFFER also as connection buffer during setup.  Because of
 ;; this, its original contents must be saved, and restored once
 ;; connection has been setup.
@@ -3046,7 +3050,7 @@ implementation will be used."
 	       :command `("cat" ,tmpstderr)
 	       :coding coding
 	       :noquery t
-	       :filter nil
+	       :filter (dece-tramp-filter nil)
 	       :sentinel #'ignore
 	       :file-handler t))
 
@@ -3080,71 +3084,42 @@ implementation will be used."
 			       (if (symbolp coding) coding (cdr coding))))
 			  (clear-visited-file-modtime)
 			  (narrow-to-region (point-max) (point-max))
-			  (catch 'suppress
-			    ;; Set the pid of the remote shell.  This
-			    ;; is needed when sending signals
-			    ;; remotely.
-			    (let ((pid
-				   (tramp-send-command-and-read v "echo $$")))
-			      (setq p (tramp-get-connection-process v))
-			      (process-put p 'remote-pid pid)
-			      (tramp-set-connection-property
-			       p "remote-pid" pid))
-			    ;; Disable carriage return to newline
-			    ;; translation.  This does not work on
-			    ;; macOS, see Bug#50748.
-			    (when (and (memq connection-type '(nil pipe))
-				       (not
-					(tramp-check-remote-uname v "Darwin")))
-			      (tramp-send-command v "stty -icrnl"))
-			    ;; `tramp-maybe-open-connection' and
-			    ;; `tramp-send-command-and-read' could
-			    ;; have trashed the connection buffer.
-			    ;; Remove this.
-			    (widen)
-			    (delete-region mark (point-max))
-			    (narrow-to-region (point-max) (point-max))
-			    ;; Now do it.
-			    (if command
-				;; Send the command.
-				(tramp-send-command v command nil t) ; nooutput
-			      ;; Check, whether a pty is associated.
-			      (unless (process-get p 'remote-tty)
-				(tramp-error
-				 v 'file-error
-				 "pty association is not supported for `%s'"
-				 name))))
-			  ;; Set sentinel and filter.
-			  (when sentinel
-			    (set-process-sentinel p sentinel))
-			  (when filter
-			    (set-process-filter p filter))
-			  (process-put p 'remote-command orig-command)
-			  (tramp-set-connection-property
-			   p "remote-command" orig-command)
-			  ;; Set query flag and process marker for
-			  ;; this process.  We ignore errors, because
-			  ;; the process could have finished already.
-			  (ignore-errors
-			    (set-process-query-on-exit-flag p (null noquery))
-			    (set-marker (process-mark p) (point)))
-			  ;; We must flush them here already;
-			  ;; otherwise `delete-file' will fail.
-			  (tramp-flush-connection-property v "process-name")
-			  (tramp-flush-connection-property v "process-buffer")
-			  ;; Kill stderr process and delete named pipe.
-			  (when (bufferp stderr)
-			    (add-function
-			     :after (process-sentinel p)
-			     (lambda (_proc _msg)
-			       (ignore-errors
-				 (while (accept-process-output
-					 (get-buffer-process stderr) 0 nil t))
-				 (delete-process (get-buffer-process stderr)))
-			       (ignore-errors
-				 (delete-file remote-tmpstderr)))))
-			  ;; Return process.
-			  p)))
+			  ;; Now do it.
+			  (if command
+			      ;; Send the command.
+			      (tramp-send-command v command nil t) ; nooutput
+			    ;; Check, whether a pty is associated.
+			    (unless (process-get p 'remote-tty)
+			      (tramp-error
+			       v 'file-error
+			       "pty association is not supported for `%s'"
+			       name))))
+			;; Set sentinel and filter.
+			(when sentinel
+			  (set-process-sentinel p sentinel))
+			(when filter (set-process-filter p (dece-tramp-filter filter)))
+			(process-put p 'remote-command orig-command)
+			(tramp-set-connection-property
+			 p "remote-command" orig-command)
+			;; Set query flag and process marker for this
+			;; process.  We ignore errors, because the
+			;; process could have finished already.
+			(ignore-errors
+			  (set-process-query-on-exit-flag p (null noquery))
+			  (set-marker (process-mark p) (point)))
+			;; Kill stderr process and delete named pipe.
+			(when (bufferp stderr)
+			  (add-function
+			   :after (process-sentinel p)
+			   (lambda (_proc _msg)
+			     (ignore-errors
+			       (while (accept-process-output
+				       (get-buffer-process stderr) 0 nil t))
+			       (delete-process (get-buffer-process stderr)))
+			     (ignore-errors
+			       (delete-file remote-tmpstderr)))))
+			;; Return process.
+			p)))
 
 		  ;; Save exit.
 		  (if (string-prefix-p tramp-temp-buffer-name (buffer-name))
@@ -3860,7 +3835,7 @@ Fall back to normal file name handler if no Tramp handler exists."
 	(process-put p 'events events)
 	(process-put p 'watch-name localname)
 	(set-process-query-on-exit-flag p nil)
-	(set-process-filter p filter)
+	(set-process-filter p (dece-tramp-filter filter))
 	(set-process-sentinel p #'tramp-file-notify-process-sentinel)
 	;; There might be an error if the monitor is not supported.
 	;; Give the filter a chance to read the output.
@@ -4204,11 +4179,13 @@ variable PATH."
 	  (string-join (tramp-get-remote-path vec) ":")))
 	(pipe-buf
 	 (with-tramp-connection-property vec "pipe-buf"
-	   (tramp-send-command-and-read
-	    vec
-            (format "getconf PIPE_BUF / 2>%s || echo 4096"
-                    (tramp-get-remote-null-device vec))
-            'noerror)))
+           (or
+	    (tramp-send-command-and-read
+	     vec
+             (format "getconf PIPE_BUF / 2>%s || echo 4096"
+                     (tramp-get-remote-null-device vec))
+             'noerror)
+            4096)))
 	tmpfile chunk chunksize)
     (tramp-message vec 5 "Setting $PATH environment variable")
     (if (< (length command) pipe-buf)
@@ -5232,6 +5209,7 @@ connection if a previous connection has died for some reason."
 
 		;; Set sentinel and query flag.  Initialize variables.
 		(set-process-sentinel p #'tramp-process-sentinel)
+		(set-process-filter p (dece-tramp-filter nil))
 		(process-put p 'vector vec)
 		(process-put p 'adjust-window-size-function #'ignore)
 		(set-process-query-on-exit-flag p nil)

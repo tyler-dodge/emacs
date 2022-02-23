@@ -600,6 +600,11 @@ select_window_1 (Lisp_Object window, bool inhibit_point_swap)
 			 BUF_PT_BYTE (XBUFFER (ow->contents)));
     }
 
+
+  /* Forcing update so that the fringes will be redrawn based on if they are active. */
+  apply_window_adjustment(XWINDOW(selected_window));
+  apply_window_adjustment(XWINDOW(window));
+  windows_or_buffers_changed = 35;
   selected_window = window;
 
   /* Go to the point recorded in the window.

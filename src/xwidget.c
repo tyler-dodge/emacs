@@ -3940,6 +3940,7 @@ syms_of_xwidget (void)
 #endif
   defsubr (&Skill_xwidget);
 
+
   DEFSYM (QCxwidget, ":xwidget");
   DEFSYM (QCtitle, ":title");
 

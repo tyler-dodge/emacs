@@ -4087,11 +4087,11 @@ MODULES_OBJ=
 NEED_DYNLIB=no
 case $opsys in
   cygwin|mingw32) MODULES_SUFFIX=".dll" ;;
-  darwin) MODULES_SUFFIX=".dylib" ;;
+  darwin) MODULES_SUFFIX=".so" ;;
   *) MODULES_SUFFIX=".so" ;;
 esac
 case "${opsys}" in
-  darwin) MODULES_SECONDARY_SUFFIX='.so' ;;
+  darwin) MODULES_SECONDARY_SUFFIX='.dylib' ;;
   *) MODULES_SECONDARY_SUFFIX='' ;;
 esac
 

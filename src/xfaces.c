@@ -5724,6 +5724,7 @@ realize_basic_faces (struct frame *f)
       realize_named_face (f, Qmode_line_inactive, MODE_LINE_INACTIVE_FACE_ID);
       realize_named_face (f, Qtool_bar, TOOL_BAR_FACE_ID);
       realize_named_face (f, Qfringe, FRINGE_FACE_ID);
+      realize_named_face (f, Qfringe_active, FRINGE_ACTIVE_FACE_ID);
       realize_named_face (f, Qheader_line, HEADER_LINE_FACE_ID);
       realize_named_face (f, Qscroll_bar, SCROLL_BAR_FACE_ID);
       realize_named_face (f, Qborder, BORDER_FACE_ID);
@@ -7139,6 +7140,7 @@ syms_of_xfaces (void)
   DEFSYM (Qtool_bar, "tool-bar");
   DEFSYM (Qtab_bar, "tab-bar");
   DEFSYM (Qfringe, "fringe");
+  DEFSYM (Qfringe_active, "fringe-active");
   DEFSYM (Qtab_line, "tab-line");
   DEFSYM (Qheader_line, "header-line");
   DEFSYM (Qscroll_bar, "scroll-bar");
