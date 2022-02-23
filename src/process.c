@@ -31,6 +31,7 @@ along with GNU Emacs.  If not, see <https://www.gnu.org/licenses/>.  */
 #include <fcntl.h>
 
 #include "lisp.h"
+#include "systhread.h"
 
 /* Only MS-DOS does not define `subprocesses'.  */
 #ifdef subprocesses
@@ -273,6 +274,743 @@ static void exec_sentinel (Lisp_Object, Lisp_Object);
 static Lisp_Object
 network_lookup_address_info_1 (Lisp_Object host, const char *service,
                                struct addrinfo *hints, struct addrinfo **res);
+
+/*
+ * The max size in bytes for the output buffers used by the process output producer thread.
+ */
+#define PROCESS_OUTPUT_MAX (1024 * 1024 * 20)
+
+struct process_output_buffer
+{
+  pid_t pid;
+  int channel;
+  int fd;
+  bool completed;
+  int buffer_size;
+  int error;
+  bool released;
+  bool ignored;
+  char buffer[PROCESS_OUTPUT_MAX + 1];
+  struct process_output_buffer * prev;
+  struct process_output_buffer * next;
+};
+
+
+/*
+ * The mutex used for controlling access to process_output_buffer_list.
+ */
+static sys_mutex_t process_output_buffer_list_mutex;
+
+void
+process_output_buffer_list_mutex_lock(void)
+{
+  int xerrno = errno;
+  sys_mutex_lock(&process_output_buffer_list_mutex);
+  errno = xerrno;
+}
+
+void
+process_output_buffer_list_mutex_unlock(void)
+{
+  int xerrno = errno;
+  sys_mutex_unlock(&process_output_buffer_list_mutex);
+  errno = xerrno;
+}
+
+static struct process_output_buffer * process_output_buffer_list = NULL;
+
+/*
+ * The mutex used for controlling access to process_output_ready_fds fd_set.
+ */
+static sys_mutex_t process_output_ready_fds_mutex;
+
+void
+process_output_ready_fds_mutex_lock(void)
+{
+  int xerrno = errno;
+  sys_mutex_lock(&process_output_ready_fds_mutex);
+  errno = xerrno;
+}
+
+void
+process_output_ready_fds_mutex_unlock(void)
+{
+  int xerrno = errno;
+  sys_mutex_unlock(&process_output_ready_fds_mutex);
+  errno = xerrno;
+}
+
+/* Signals that the consumer is ready for the producer to produce a new output buffer */
+static int process_output_consumer_ready_read_fd = -1;
+static int process_output_consumer_ready_write_fd = -1;
+
+static sys_mutex_t process_output_consumer_notification_mutex;
+static bool process_output_consumer_ready_has_notification = false;
+
+bool
+process_output_consumer__locked_has_notification(void)
+{
+  bool value;
+  sys_mutex_lock(&process_output_consumer_notification_mutex);
+  value = process_output_consumer_ready_has_notification;
+  sys_mutex_unlock(&process_output_consumer_notification_mutex);
+  return value;
+}
+
+void
+process_output_consumer__locked_set_notification(bool new_value)
+{
+  sys_mutex_lock(&process_output_consumer_notification_mutex);
+  process_output_consumer_ready_has_notification = new_value;
+  sys_mutex_unlock(&process_output_consumer_notification_mutex);
+}
+
+/*
+ * Called by the consumer to signal to the producer
+ * that the consumer has changed the process_output_buffers list
+ */
+void
+process_output_consumer_write_ready_notification_fd(void)
+{
+  if (!process_output_consumer__locked_has_notification())
+    {
+      char throwaway[1] = { '\n' };
+      if (emacs_write(process_output_consumer_ready_write_fd, &throwaway, 1) > 0)
+	{
+	  process_output_consumer__locked_set_notification(true);
+	}
+    }
+}
+
+/*
+ * Called by the producer to acknowledge
+ * that the consumer has consumed all of the output available.
+ */
+int
+process_output_consumer_drain_ready_notification_fd(void)
+{
+  if (!process_output_consumer__locked_has_notification())
+    {
+      return 0;
+    }
+
+  char throwaway[128];
+  int output = emacs_read(process_output_consumer_ready_read_fd, throwaway, 128);
+  if (output == -1)
+    {
+      if (!would_block(errno))
+	{
+	  emacs_perror("Failed to drain ready fd");
+	}
+    }
+
+  process_output_consumer__locked_set_notification(false);
+
+  return output;
+}
+
+
+/* Signals that the producer is ready for the consumer to consume an output buffer */
+static int process_output_producer_ready_read_fd = -1;
+static int process_output_producer_ready_write_fd = -1;
+
+static sys_mutex_t process_output_producer_notification_mutex;
+static bool process_output_producer_has_notification = false;
+
+bool
+process_output_producer__locked_has_notification(void)
+{
+  bool value;
+  sys_mutex_lock(&process_output_producer_notification_mutex);
+  value = process_output_producer_has_notification;
+  sys_mutex_unlock(&process_output_producer_notification_mutex);
+  return value;
+}
+
+void
+process_output_producer__locked_set_notification(bool new_value)
+{
+  sys_mutex_lock(&process_output_producer_notification_mutex);
+  process_output_producer_has_notification = new_value;
+  sys_mutex_unlock(&process_output_producer_notification_mutex);
+}
+
+/*
+ * Called by both the producer to signal
+ * there is no more output available in any buffers.
+ */
+int
+process_output_producer_drain_notification_fd(void)
+{
+  if (!process_output_producer__locked_has_notification())
+    {
+      return 0;
+    }
+
+  char throwaway[1];
+  int output = emacs_read(process_output_producer_ready_read_fd, throwaway, 1);
+  if (output == -1)
+    {
+      if (!would_block(errno))
+	{
+	  emacs_perror("Failed to drain ready fd");
+	}
+    }
+
+  process_output_producer__locked_set_notification(false);
+
+  return output;
+}
+
+
+/*
+ * Called by producer to signal that there is output
+ * available in the process_output_buffers
+ */
+void
+process_output_producer_write_notification_fd(void)
+{
+  if (!process_output_producer__locked_has_notification())
+    {
+      char throwaway[1] = { '\n' };
+      if (emacs_write(process_output_producer_ready_write_fd, &throwaway, 1) > 0)
+	{
+	  process_output_producer__locked_set_notification(true);
+	}
+    }
+}
+
+/* The max fd used by process_output_buffers. Can be safely accessed by the consumer thread */
+static int process_output_buffers_ready_max_fd = 0;
+
+/* Tracks the total amount of buffers with output ready that are waiting to be consumed. */
+static int process_output_buffers_ready_count = 0;
+
+/* The fd set that represents the process output buffers that have output available */
+static fd_set process_output_buffers_ready_fds;
+
+/* The fd set used by the consumer thread to check if it the fd is being processed by the producer thread */
+static fd_set process_output_consumer_tracked_fds;
+
+/*
+ * Lookup active process output buffer by channel pid tuple.
+ * Expected to be called while process_output_buffer_list_mutex_lock() is held.
+ */
+struct process_output_buffer *
+process_output_buffer_get_active_by_channel_pid(int channel, int pid)
+{
+  struct process_output_buffer * buffer = process_output_buffer_list;
+  while (buffer != NULL)
+    {
+      if (buffer->channel == channel && buffer->pid == pid && !buffer->released)
+	{
+	  return buffer;
+	}
+      buffer = buffer->next;
+    }
+  return NULL;
+}
+
+/*
+ * Copies the fd_set of ready process_output_buffers for use in the main emacs event loop
+ * to indicate which processes are available for consuming output.
+ * Return the count of processes that have output available to consume.
+ */
+int
+process_output_buffers_ready_copy_fd_set(struct fd_set * destination)
+{
+  process_output_ready_fds_mutex_lock();
+  FD_COPY(&process_output_buffers_ready_fds, destination);
+  int count = process_output_buffers_ready_count;
+  process_output_ready_fds_mutex_unlock();
+  return count;
+}
+
+/*
+ * Assumed to be called where process_output_buffer_list_mutex_lock is claimed
+ */
+int
+process_output_buffer_max_fd(void)
+{
+  int xerrno = errno;
+  struct process_output_buffer * buffer = process_output_buffer_list;
+  int max_fd = -1;
+  while (buffer != NULL)
+    {
+      if (!buffer->released && buffer->fd > max_fd)
+	{
+	  max_fd = buffer->fd;
+	}
+      buffer = buffer->next;
+    }
+  errno = xerrno;
+  return max_fd;
+}
+
+/*
+ * Removes the ready fd from ready_fds for the given buffer. This is called by the consumer
+ * to indicate that it has consumed all of the output from the given buffer.
+ *Assumed to be called where process_output_buffer_list_mutex_lock is claimed.
+ */
+void
+process_output_buffer_consumer_clear_ready_fd(struct process_output_buffer * buffer)
+{
+  int fd = buffer->fd;
+  int xerrno = errno;
+  if (fd < 0)
+    {
+      error("Unexpected fd < 0\n");
+      return;
+    }
+  process_output_buffers_ready_max_fd = process_output_buffer_max_fd();
+  process_output_ready_fds_mutex_lock();
+  if (FD_ISSET(fd, &process_output_buffers_ready_fds))
+    {
+      process_output_buffers_ready_count--;
+      FD_CLR(fd, &process_output_buffers_ready_fds);
+    }
+  process_output_ready_fds_mutex_unlock();
+  errno = xerrno;
+}
+
+
+/*
+ * Called by the producer thread to add fds to process_output_buffers_ready_fds.
+ */
+void
+process_output_buffer_producer_set_ready_fd(struct process_output_buffer * buffer)
+{
+  int fd = buffer->fd;
+  if (fd < 0)
+    {
+      error("Unexpected fd < 0\n");
+      return;
+    }
+  int xerrno = errno;
+  process_output_ready_fds_mutex_lock();
+  if (!FD_ISSET(fd, &process_output_buffers_ready_fds))
+    {
+      if (fd > process_output_buffers_ready_max_fd)
+	{
+	  process_output_buffers_ready_max_fd = fd;
+	}
+      process_output_buffers_ready_count++;
+      FD_SET(fd, &process_output_buffers_ready_fds);
+    }
+  process_output_ready_fds_mutex_unlock();
+  errno = xerrno;
+}
+
+
+/*
+ * Looks up the buffer corresponding to the channel pid tuple, and copies over
+ * maximum tbyte into buf.
+ *
+ * Designed to behave similarly to read.
+ *
+ * Returns the actual size of the buffer written.
+ *
+ */
+ptrdiff_t
+process_output_consumer_read(int channel, int pid, void * buf, ptrdiff_t nbyte)
+{
+  process_output_buffer_list_mutex_lock();
+  struct process_output_buffer * buffer = process_output_buffer_get_active_by_channel_pid(channel, pid);
+  if (buffer == NULL)
+    {
+      process_output_buffer_list_mutex_unlock();
+      return 0;
+    }
+
+  struct timespec now = current_timespec();
+  int buffer_size = 0;
+  bool larger_than_buffer = buffer->buffer_size > nbyte;
+  if (larger_than_buffer)
+    {
+      memcpy(buf, (char *)buffer->buffer, nbyte);
+      const int newSize = buffer->buffer_size - nbyte;
+      memcpy((char *)buffer->buffer, (char *)buffer->buffer + nbyte, newSize);
+      buffer->buffer_size = newSize;
+      buffer_size = nbyte;
+    }
+  else if (buffer->buffer_size > 0)
+    {
+      buffer_size = buffer->buffer_size;
+      memcpy(buf, (char *)buffer->buffer, buffer->buffer_size);
+      buffer->buffer_size = 0;
+    }
+
+
+  const bool completed = buffer->completed;
+  const int fd = buffer->fd;
+
+
+  if (buffer_size == 0)
+    {
+      if (completed)
+	{
+	  buffer->released = true;
+	  FD_CLR(fd, &process_output_consumer_tracked_fds);
+	  process_output_consumer_write_ready_notification_fd();
+	  process_output_buffer_consumer_clear_ready_fd(buffer);
+	}
+      else
+	{
+	  buffer->error = 0;
+	}
+      process_output_buffer_consumer_clear_ready_fd(buffer);
+    }
+  else
+    {
+      process_output_consumer_write_ready_notification_fd();
+    }
+  const int saved_errno = buffer->error;
+
+
+  process_output_buffer_list_mutex_unlock();
+
+  if (buffer_size == 0)
+    {
+      if (completed && (saved_errno == 0 || saved_errno == EAGAIN))
+	{
+	  return 0;
+	}
+      if (saved_errno == 0)
+	{
+	  errno = EAGAIN;
+	}
+      else
+	{
+	  errno = saved_errno;
+	}
+      return -1;
+    }
+  return buffer_size;
+}
+
+/*
+ * Adds the fd to be tracked by the process output producer thread.
+ * This is meant to be called by the consumer thread in order to let the output producer thread
+ * know about any new fds that need to be consumed.
+ */
+void
+process_output_consumer_track_fd(int channel, int pid, int fd, bool start_ignored)
+{
+  if (fd < 0)
+    {
+      printf("Skipping process with negative pid / fd\n");
+      return;
+    }
+  process_output_buffer_list_mutex_lock();
+
+  if (process_output_buffer_get_active_by_channel_pid(channel, pid) != NULL)
+    {
+      process_output_buffer_list_mutex_unlock();
+      return;
+    }
+
+  struct process_output_buffer * buffer = xmalloc(sizeof(struct process_output_buffer));
+  buffer->pid = pid;
+  buffer->fd = fd;
+  buffer->error = 0;
+  buffer->buffer_size = 0;
+  buffer->channel = channel;
+  buffer->completed = false;
+  buffer->released = false;
+  buffer->ignored = start_ignored;
+  buffer->prev = NULL;
+
+  buffer->next = process_output_buffer_list;
+  bool first_buffer = process_output_buffer_list == NULL;
+  if (!first_buffer)
+    {
+      process_output_buffer_list->prev = buffer;
+    }
+
+  process_output_buffer_list = buffer;
+  process_output_consumer_write_ready_notification_fd();
+  process_output_buffer_list_mutex_unlock();
+  FD_SET(channel, &process_output_consumer_tracked_fds);
+}
+
+/*
+ * Buffer used by the producer thread in order to copy from the calls to read.
+ * Only used by the producer thread, but allocated off of the stack as an optimization.
+ */
+static char process_output_producer_copy_buffer[PROCESS_OUTPUT_MAX];
+
+/*
+ * Background thread that handles consuming output from fds scheduled by process_output_consumer_track_fd.
+ */
+void *
+process_output_producer_thread(void * args)
+{
+  fd_set ready_fds;
+  fd_set outputting_fds;
+  fd_set tracked_fds;
+  struct timespec no_timeout = make_timespec(0, 0);
+
+  FD_ZERO(&ready_fds);
+  FD_ZERO(&outputting_fds);
+  FD_ZERO(&tracked_fds);
+  while (1)
+    {
+      struct timespec now = current_timespec();
+      fd_set fds;
+      FD_ZERO(&fds);
+      int notify_fd = process_output_consumer_ready_read_fd;
+      FD_SET(notify_fd, &fds);
+
+      process_output_buffer_list_mutex_lock();
+      if (FD_ISSET(notify_fd, &ready_fds))
+	{
+	  process_output_consumer_drain_ready_notification_fd();
+	}
+
+      struct process_output_buffer * buffer = process_output_buffer_list;
+      int maxFd = notify_fd;
+      int readingCount = 0;
+      bool has_output = false;
+      while (buffer != NULL)
+	{
+	  if (buffer->completed || buffer->released)
+	    {
+	      struct process_output_buffer * next = buffer->next;
+	      if (buffer->released)
+		{
+		  FD_CLR(buffer->fd, &tracked_fds);
+		  if (buffer == process_output_buffer_list)
+		    {
+		      process_output_buffer_list = buffer->next;
+		    }
+		  if (buffer->prev != NULL)
+		    {
+		      buffer->prev->next = buffer->next;
+		    }
+		  if (buffer->next != NULL)
+		    {
+		      buffer->next->prev = buffer->prev;
+		    }
+		  xfree((void *) buffer);
+		}
+	      else if (!buffer->ignored)
+		{
+		  has_output = true;
+
+		  process_output_buffer_producer_set_ready_fd(buffer);
+		}
+	      buffer = next;
+	      continue;
+	    }
+
+
+	  const int fd = buffer->fd;
+	  if (fd > maxFd)
+	    {
+	      maxFd = fd;
+	    }
+
+	  const int outputSize = PROCESS_OUTPUT_MAX - buffer->buffer_size;
+	  int updatedSize;
+	  if (outputSize == 0 || buffer->ignored)
+	    {
+	      buffer = buffer->next;
+	      continue;
+	    }
+
+	  FD_SET(fd, &fds);
+
+	  if (FD_ISSET(fd, &ready_fds) || FD_ISSET(fd, &outputting_fds) || !FD_ISSET(fd, &tracked_fds))
+	    {
+	      process_output_buffer_list_mutex_unlock();
+	      FD_SET(fd, &tracked_fds);
+	      updatedSize = emacs_read(fd, process_output_producer_copy_buffer, outputSize);
+	      if (updatedSize > 0)
+		{
+		  FD_SET(fd, &outputting_fds);
+		}
+	      else
+		{
+		  FD_CLR(fd, &outputting_fds);
+		}
+	      process_output_buffer_list_mutex_lock();
+	    }
+	  else
+	    {
+	      updatedSize = -1;
+	      errno = EAGAIN;
+	    }
+
+	  if (updatedSize > 0)
+	    {
+	      // buffer_size should only decrease between locks so this'll be fine.
+	      memcpy(buffer->buffer + buffer->buffer_size, process_output_producer_copy_buffer, updatedSize);
+	    }
+
+	  if (errno != 0)
+	    {
+	      buffer->error = errno;
+	    }
+	  else
+	    {
+	      buffer->error = 0;
+	    }
+	  if (updatedSize > 0)
+	    {
+	      buffer->buffer_size += updatedSize;
+	    }
+
+	  if (updatedSize == 0 || (updatedSize == -1 && !would_block(buffer->error)))
+	    {
+	      buffer->completed = true;
+	    }
+
+	  if (!buffer->released)
+	    {
+	      if (buffer->buffer_size > 0 || buffer->completed)
+		{
+		  readingCount++;
+		  has_output = true;
+		  process_output_buffer_producer_set_ready_fd(buffer);
+		}
+	    }
+
+	  buffer = buffer->next;
+	}
+      if (has_output)
+	{
+	  process_output_producer_write_notification_fd();
+	}
+      else
+	{
+	  process_output_producer_drain_notification_fd();
+	}
+      process_output_buffer_list_mutex_unlock();
+
+      struct timespec * select_timeout = readingCount == 0 ? NULL : &no_timeout;
+
+      pselect(maxFd + 1, &fds, NULL, NULL, select_timeout, NULL);
+      FD_COPY(&fds, &ready_fds);
+    }
+  return NULL;
+}
+
+/*
+ * Called by the main thread to let the output producer thread know that a channel pid pair
+ * is no longer going to be used.
+ */
+void
+process_output_consumer_deactivate_fd(int channel, int pid)
+{
+  process_output_buffer_list_mutex_lock();
+  struct process_output_buffer * buffer = process_output_buffer_get_active_by_channel_pid(channel, pid);
+  if (buffer != NULL)
+    {
+      buffer->released = true;
+      FD_CLR(channel, &process_output_consumer_tracked_fds);
+      process_output_buffer_consumer_clear_ready_fd(buffer);
+    }
+  process_output_buffer_list_mutex_unlock();
+}
+
+/*
+ * Should only be called from the main thread.
+ */
+bool
+process_output_consumer_fd_tracked_p(int channel)
+{
+  return channel >= 0 && FD_ISSET(channel, &process_output_consumer_tracked_fds);
+}
+
+void
+process_output_consumer_ignore_fd(int channel, int pid)
+{
+  if (!process_output_consumer_fd_tracked_p(channel))
+    {
+      return;
+    }
+  process_output_buffer_list_mutex_lock();
+  struct process_output_buffer * buffer = process_output_buffer_get_active_by_channel_pid(channel, pid);
+  if (buffer != NULL)
+    {
+      buffer->ignored = true;
+      process_output_buffer_consumer_clear_ready_fd(buffer);
+    }
+  process_output_buffer_list_mutex_unlock();
+}
+void
+process_output_consumer_unignore_fd(int channel, int pid)
+{
+  if (!process_output_consumer_fd_tracked_p(channel))
+    {
+      return;
+    }
+  process_output_buffer_list_mutex_lock();
+  struct process_output_buffer * buffer = process_output_buffer_get_active_by_channel_pid(channel, pid);
+  if (buffer != NULL)
+    {
+      buffer->ignored = false;
+    }
+  process_output_buffer_list_mutex_unlock();
+}
+
+
+/*
+ * Handles initializing the process_output_producer thread, and all of the necessary mutexes and file descriptors
+ * necessary to communicate with it.
+ */
+void
+process_output_producer_thread_init(void)
+{
+  FD_ZERO(&process_output_buffers_ready_fds);
+  sys_mutex_init(&process_output_buffer_list_mutex);
+  sys_mutex_init(&process_output_ready_fds_mutex);
+  sys_mutex_init(&process_output_producer_notification_mutex);
+  sys_mutex_init(&process_output_consumer_notification_mutex);
+
+  int fds[2];
+  if (emacs_pipe (fds) < 0)
+    {
+      emacs_perror("Failed to create not empty fd");
+    }
+
+  if (fcntl (fds[0], F_SETFL, O_NONBLOCK) != 0)
+    {
+      emacs_perror ("fcntl");
+    }
+
+  if (fcntl (fds[1], F_SETFL, O_NONBLOCK) != 0)
+    {
+      emacs_perror ("fcntl");
+    }
+
+  process_output_consumer_ready_read_fd = fds[0];
+  process_output_consumer_ready_write_fd = fds[1];
+
+  if (emacs_pipe (fds) < 0)
+    {
+      emacs_perror("Failed to create not empty fd");
+    }
+
+  if (fcntl (fds[0], F_SETFL, O_NONBLOCK) != 0)
+    {
+      emacs_perror ("fcntl");
+    }
+  if (fcntl (fds[1], F_SETFL, O_NONBLOCK) != 0)
+    {
+      emacs_perror ("fcntl");
+    }
+
+  process_output_producer_ready_read_fd = fds[0];
+  process_output_producer_ready_write_fd = fds[1];
+
+  pthread_t process_buffer_thread;
+
+  if (pthread_create(&process_buffer_thread, NULL, &process_output_producer_thread, NULL) != 0)
+    {
+      emacs_perror("Failed to create process output consumer");
+    }
+}
 
 /* Number of bits set in connect_wait_mask.  */
 static int num_pending_connects;
@@ -1125,6 +1863,8 @@ Interactively, it will kill the current buffer's process.  */)
       if (p->alive)
 	record_kill_process (p, Qnil);
 
+      process_output_consumer_deactivate_fd(p->infd, p->pid);
+
       if (p->infd >= 0)
 	{
 	  /* Update P's status, since record_kill_process will make the
@@ -1326,11 +2066,17 @@ static void
 set_process_filter_masks (struct Lisp_Process *p)
 {
   if (EQ (p->filter, Qt) && !EQ (p->status, Qlisten))
-    delete_read_fd (p->infd);
+    {
+      delete_read_fd (p->infd);
+      process_output_consumer_ignore_fd(p->infd, p->pid);
+    }
   else if (EQ (p->filter, Qt)
-	   /* Network or serial process not stopped:  */
-	   && !EQ (p->command, Qt))
-    add_process_read_fd (p->infd);
+    /* Network or serial process not stopped:  */
+    && !EQ (p->command, Qt))
+    {
+      add_process_read_fd (p->infd);
+      process_output_consumer_unignore_fd(p->infd, p->pid);
+    }
 }
 
 static bool
@@ -1379,12 +2125,18 @@ The string argument is normally a multibyte string, except:
     {
       /* If filter WILL be t, stop reading output.  */
       if (EQ (filter, Qt) && !EQ (p->status, Qlisten))
-        delete_read_fd (p->infd);
+	{
+	  delete_read_fd (p->infd);
+	  process_output_consumer_ignore_fd(p->infd, p->pid);
+	}
       else if (/* If filter WAS t, then resume reading output.  */
-               EQ (p->filter, Qt)
-               /* Network or serial process not stopped:  */
-               && !EQ (p->command, Qt))
-        add_process_read_fd (p->infd);
+	       EQ (p->filter, Qt)
+	       /* Network or serial process not stopped:  */
+	       && !EQ (p->command, Qt))
+	{
+	  add_process_read_fd (p->infd);
+	  process_output_consumer_unignore_fd(p->infd, p->pid);
+	}
     }
 
   pset_filter (p, filter);
@@ -2259,7 +3011,7 @@ create_process (Lisp_Object process, char **new_argv, Lisp_Object current_dir)
 
   p->pid = pid;
   if (pid >= 0)
-    p->alive = 1;
+     p->alive = 1;
 
   /* Stop blocking in the parent.  */
   unblock_child_signal (&oldset);
@@ -2303,6 +3055,7 @@ create_process (Lisp_Object process, char **new_argv, Lisp_Object current_dir)
 	  struct Lisp_Process *pp = XPROCESS (p->stderrproc);
 	  close_process_fd (&pp->open_fd[SUBPROCESS_STDOUT]);
 	}
+      process_output_consumer_track_fd(p->infd, p->pid, p->infd, EQ (p->command, Qt) || EQ (p->filter, Qt));
     }
 }
 
@@ -2312,6 +3065,8 @@ create_pty (Lisp_Object process)
   struct Lisp_Process *p = XPROCESS (process);
   char pty_name[PTY_NAME_SIZE];
   int pty_fd = !(p->pty_in || p->pty_out) ? -1 : allocate_pty (pty_name);
+
+  p->pid = -2;
 
   if (pty_fd >= 0)
     {
@@ -2355,11 +3110,10 @@ create_pty (Lisp_Object process)
 
       if (!EQ (p->filter, Qt))
 	add_process_read_fd (pty_fd);
+      process_output_consumer_track_fd(p->infd, p->pid, p->infd, false);
 
       pset_tty_name (p, build_string (pty_name));
     }
-
-  p->pid = -2;
 }
 
 DEFUN ("make-pipe-process", Fmake_pipe_process, Smake_pipe_process,
@@ -2462,9 +3216,13 @@ usage:  (make-pipe-process &rest ARGS)  */)
     pset_command (p, Qt);
   eassert (! p->pty_in && ! p->pty_out);
 
+  process_output_consumer_track_fd(p->infd, p->pid, p->infd, EQ (p->command, Qt));
+
   if (!EQ (p->command, Qt)
       && !EQ (p->filter, Qt))
     add_process_read_fd (inchannel);
+
+
   p->adaptive_read_buffering
     = (NILP (Vprocess_adaptive_read_buffering) ? 0
        : EQ (Vprocess_adaptive_read_buffering, Qt) ? 1 : 2);
@@ -3174,6 +3932,7 @@ usage:  (make-serial-process &rest ARGS)  */)
     report_file_errno ("Opening serial port", port, EMFILE);
   p->infd = fd;
   p->outfd = fd;
+
   if (fd > max_desc)
     max_desc = fd;
   eassert (0 <= fd && fd < FD_SETSIZE);
@@ -3196,10 +3955,13 @@ usage:  (make-serial-process &rest ARGS)  */)
   if (tem = plist_get (contact, QCstop), !NILP (tem))
     pset_command (p, Qt);
   eassert (! p->pty_in && ! p->pty_out);
+  process_output_consumer_track_fd(p->infd, p->pid, p->infd, EQ (p->command, Qt) || EQ (p->filter, Qt));
 
   if (!EQ (p->command, Qt)
-      && !EQ (p->filter, Qt))
-    add_process_read_fd (fd);
+    && !EQ (p->filter, Qt))
+    {
+      add_process_read_fd (fd);
+    }
 
   update_process_mark (p);
 
@@ -3352,7 +4114,7 @@ finish_after_tls_connection (Lisp_Object proc)
   if (NILP (result))
     {
       pset_status (p, list2 (Qfailed,
-			     build_string ("The Network Security Manager stopped the connections")));
+	  build_string ("The Network Security Manager stopped the connections")));
       deactivate_process (proc);
     }
   else if (p->outfd < 0)
@@ -3698,18 +4460,26 @@ connect_network_socket (Lisp_Object proc, Lisp_Object addrinfos,
 	 in that case, we still need to signal this like a non-blocking
 	 connection.  */
       if (! (connecting_status (p->status)
-	     && EQ (XCDR (p->status), addrinfos)))
+	  && EQ (XCDR (p->status), addrinfos)))
 	pset_status (p, Fcons (Qconnect, addrinfos));
       eassert (0 <= inch && inch < FD_SETSIZE);
       if ((fd_callback_info[inch].flags & NON_BLOCKING_CONNECT_FD) == 0)
 	add_non_blocking_write_fd (inch);
     }
   else
-    /* A server may have a client filter setting of Qt, but it must
-       still listen for incoming connects unless it is stopped.  */
-    if ((!EQ (p->filter, Qt) && !EQ (p->command, Qt))
+    {
+      /* A server may have a client filter setting of Qt, but it must
+	 still listen for incoming connects unless it is stopped.  */
+      if ((!EQ (p->filter, Qt) && !EQ (p->command, Qt))
 	|| (EQ (p->status, Qlisten) && NILP (p->command)))
-      add_process_read_fd (inch);
+	{
+	  add_process_read_fd (inch);
+	}
+      else
+	{
+	}
+    }
+
 
   if (inch > max_desc)
     max_desc = inch;
@@ -4195,7 +4965,7 @@ usage: (make-network-process &rest ARGS)  */)
 	    {
 	      struct servent *svc_info
 		= getservbyname (SSDATA (service),
-				 socktype == SOCK_DGRAM ? "udp" : "tcp");
+		  socktype == SOCK_DGRAM ? "udp" : "tcp");
 	      if (svc_info)
 		port = ntohs (svc_info->s_port);
 	    }
@@ -4254,8 +5024,10 @@ usage: (make-network-process &rest ARGS)  */)
     p->backlog = XFIXNUM (server);
 
   /* :nowait BOOL */
-  if (!p->is_server && socktype != SOCK_DGRAM && nowait)
-    p->is_non_blocking_client = true;
+  if (!p->is_server && socktype != SOCK_STREAM && socktype != SOCK_DGRAM && nowait)
+    {
+      p->is_non_blocking_client = true;
+    }
 
   bool postpone_connection = false;
 #ifdef HAVE_GETADDRINFO_A
@@ -4759,6 +5531,7 @@ deactivate_process (Lisp_Object proc)
   struct Lisp_Process *p = XPROCESS (proc);
   int i;
 
+
 #ifdef HAVE_GNUTLS
   /* Delete GnuTLS structures in PROC, if any.  */
   emacs_gnutls_deinit (proc);
@@ -4781,6 +5554,8 @@ deactivate_process (Lisp_Object proc)
   eassert (inchannel < FD_SETSIZE);
   if (inchannel >= 0)
     {
+      // Just in case it wasn't cleaned up elsewhere
+      process_output_consumer_deactivate_fd(inchannel, p->pid);
       p->infd  = -1;
       p->outfd = -1;
 #ifdef DATAGRAM_SOCKETS
@@ -5060,7 +5835,14 @@ server_accept_connection (Lisp_Object server, int channel)
 
   /* Client processes for accepted connections are not stopped initially.  */
   if (!EQ (p->filter, Qt))
-    add_process_read_fd (s);
+    {
+      add_process_read_fd (s);
+    }
+  else
+    {
+      process_output_consumer_ignore_fd(p->infd, p->pid);
+    }
+
   if (s > max_desc)
     max_desc = s;
 
@@ -5234,6 +6016,7 @@ wait_reading_process_output (intmax_t time_limit, int nsecs, int read_kbd,
   static int last_read_channel = -1;
   int channel, nfds;
   fd_set Available;
+  fd_set process_ready;
   fd_set Writeok;
   bool check_write;
   int check_delay;
@@ -5422,8 +6205,10 @@ wait_reading_process_output (intmax_t time_limit, int nsecs, int read_kbd,
 	{
 	  fd_set Atemp;
 	  fd_set Ctemp;
+	  int merged_max_desc = max_desc;
 
-          if (kbd_on_hold_p ())
+
+	  if (kbd_on_hold_p ())
             FD_ZERO (&Atemp);
           else
             compute_input_wait_mask (&Atemp);
@@ -5439,7 +6224,9 @@ wait_reading_process_output (intmax_t time_limit, int nsecs, int read_kbd,
 	    FD_CLR (fd, &Atemp);
 
 	  timeout = make_timespec (0, 0);
-	  if ((thread_select (pselect, max_desc + 1,
+	  fd_set process_ready;
+
+	  if ((thread_select (pselect, merged_max_desc + 1,
 			      &Atemp,
 			      (num_pending_connects > 0 ? &Ctemp : NULL),
 			      NULL, &timeout, NULL)
@@ -5516,9 +6303,13 @@ wait_reading_process_output (intmax_t time_limit, int nsecs, int read_kbd,
       else
 	{
 	  if (! read_kbd)
-	    compute_non_keyboard_wait_mask (&Available);
+	    {
+	      compute_non_keyboard_wait_mask (&Available);
+	    }
 	  else
-	    compute_input_wait_mask (&Available);
+	    {
+	      compute_input_wait_mask (&Available);
+	    }
 	  compute_write_mask (&Writeok);
  	  check_delay = wait_proc ? 0 : process_output_delay_count;
 	  check_write = true;
@@ -5670,6 +6461,10 @@ wait_reading_process_output (intmax_t time_limit, int nsecs, int read_kbd,
 		   && FD_ISSET (wait_proc->infd, &tls_available))))
 	    timeout = make_timespec (0, 0);
 #endif
+	  int ready_fd = process_output_producer_ready_read_fd;
+	  int merged_max_desc = max_desc;
+	  // Reseting available here because we don't want to react to fds being read by background reader
+	  // However, we still want it for filtering tls_fds before.
 
 #if !defined USABLE_SIGIO && !defined WINDOWSNT
 	  /* If we're polling for input, don't get stuck in select for
@@ -5680,22 +6475,40 @@ wait_reading_process_output (intmax_t time_limit, int nsecs, int read_kbd,
 	    timeout = short_timeout;
 #endif
 
+	  if (ready_fd > 0)
+	    {
+	      FD_SET(ready_fd, &Available);
+	      if (ready_fd > max_desc)
+		{
+		  merged_max_desc = ready_fd;
+		}
+	    }
 	  /* Non-macOS HAVE_GLIB builds call thread_select in xgselect.c.  */
 #if defined HAVE_GLIB && !defined HAVE_NS
-	  nfds = xg_select (max_desc + 1,
+	  nfds = xg_select (merged_max_desc + 1,
 			    &Available, (check_write ? &Writeok : 0),
 			    NULL, &timeout, NULL);
 #elif defined HAVE_NS
           /* And NS builds call thread_select in ns_select. */
-          nfds = ns_select (max_desc + 1,
+          nfds = ns_select (merged_max_desc + 1,
 			    &Available, (check_write ? &Writeok : 0),
 			    NULL, &timeout, NULL);
 #else  /* !HAVE_GLIB */
-	  nfds = thread_select (pselect, max_desc + 1,
+	  nfds = thread_select (pselect, merged_max_desc + 1,
 				&Available,
 				(check_write ? &Writeok : 0),
 				NULL, &timeout, NULL);
 #endif	/* !HAVE_GLIB */
+	  FD_ZERO(&process_ready);
+	  int ready_count = process_output_buffers_ready_copy_fd_set(&process_ready);
+
+	  if (ready_count > nfds)
+	    {
+	      nfds = ready_count;
+	    }
+	  for (channel = 0; channel < FD_SETSIZE; ++channel)
+	    if (FD_ISSET(channel, &process_ready))
+	      FD_SET(channel, &Available);
 
 #ifdef HAVE_GNUTLS
 	  /* Merge tls_available into Available. */
@@ -5842,7 +6655,7 @@ wait_reading_process_output (intmax_t time_limit, int nsecs, int read_kbd,
           struct fd_callback_data *d = &fd_callback_info[channel];
           if (d->func
 	      && ((d->flags & FOR_READ
-		   && FD_ISSET (channel, &Available))
+		  && (FD_ISSET (channel, &Available)))
 		  || ((d->flags & FOR_WRITE)
 		      && FD_ISSET (channel, &Writeok))))
             d->func (channel, d->data);
@@ -5863,7 +6676,7 @@ wait_reading_process_output (intmax_t time_limit, int nsecs, int read_kbd,
 	      continue;
 	    }
 
-	  if (FD_ISSET (channel, &Available)
+	  if ((FD_ISSET (channel, &Available))
 	      && ((fd_callback_info[channel].flags & (KEYBOARD_FD | PROCESS_FD))
 		  == PROCESS_FD))
 	    {
@@ -5922,6 +6735,7 @@ wait_reading_process_output (intmax_t time_limit, int nsecs, int read_kbd,
 		  /* Clear the descriptor now, so we only raise the
 		     signal once.  */
 		  delete_read_fd (channel);
+		  process_output_consumer_ignore_fd(channel, p->pid);
 
 		  if (p->pid == -2)
 		    {
@@ -6033,7 +6847,10 @@ wait_reading_process_output (intmax_t time_limit, int nsecs, int read_kbd,
 
 		  if (0 <= p->infd && !EQ (p->filter, Qt)
 		      && !EQ (p->command, Qt))
-		    add_process_read_fd (p->infd);
+		    {
+		      add_process_read_fd (p->infd);
+		      process_output_consumer_unignore_fd(p->infd, p->pid);
+		    }
 		}
 	    }
 	}			/* End for each file descriptor.  */
@@ -6087,6 +6904,7 @@ read_and_dispose_of_process_output (struct Lisp_Process *p, char *chars,
 				    ssize_t nbytes,
 				    struct coding_system *coding);
 
+
 /* Read pending output from the process channel,
    starting with our buffered-ahead character if we have one.
    Yield number of decoded characters read,
@@ -6110,14 +6928,14 @@ read_process_output (Lisp_Object proc, int channel)
   ptrdiff_t readmax = clip_to_bounds (1, read_process_output_max, PTRDIFF_MAX);
   specpdl_ref count = SPECPDL_INDEX ();
   Lisp_Object odeactivate;
-  char *chars;
+  char *process_output_buffer;
 
   USE_SAFE_ALLOCA;
-  chars = SAFE_ALLOCA (sizeof coding->carryover + readmax);
+  process_output_buffer = SAFE_ALLOCA (sizeof coding->carryover + readmax);
 
   if (carryover)
     /* See the comment above.  */
-    memcpy (chars, SDATA (p->decoding_buf), carryover);
+    memcpy (process_output_buffer, SDATA (p->decoding_buf), carryover);
 
 #ifdef DATAGRAM_SOCKETS
   /* We have a working select, so proc_buffered_char is always -1.  */
@@ -6125,54 +6943,59 @@ read_process_output (Lisp_Object proc, int channel)
     {
       socklen_t len = datagram_address[channel].len;
       do
-	nbytes = recvfrom (channel, chars + carryover, readmax,
-			   0, datagram_address[channel].sa, &len);
+	{
+	  nbytes = recvfrom (channel, process_output_buffer + carryover, readmax,
+	    0, datagram_address[channel].sa, &len);
+	}
       while (nbytes < 0 && errno == EINTR);
     }
   else
 #endif
     {
-      bool buffered = proc_buffered_char[channel] >= 0;
-      if (buffered)
-	{
-	  chars[carryover] = proc_buffered_char[channel];
-	  proc_buffered_char[channel] = -1;
-	}
 #ifdef HAVE_GNUTLS
       if (p->gnutls_p && p->gnutls_state)
-	nbytes = emacs_gnutls_read (p, chars + carryover + buffered,
-				    readmax - buffered);
+	{
+	  nbytes = emacs_gnutls_read (p, process_output_buffer + carryover,
+	    readmax);
+	}
       else
 #endif
-	nbytes = emacs_read (channel, chars + carryover + buffered,
-			     readmax - buffered);
-      if (nbytes > 0 && p->adaptive_read_buffering)
-	{
-	  int delay = p->read_output_delay;
-	  if (nbytes < 256)
+        {
+	  if (process_output_consumer_fd_tracked_p(channel) && !NETCONN1_P(p))
 	    {
-	      if (delay < READ_OUTPUT_DELAY_MAX_MAX)
-		{
-		  if (delay == 0)
-		    process_output_delay_count++;
-		  delay += READ_OUTPUT_DELAY_INCREMENT * 2;
-		}
+	      nbytes = process_output_consumer_read(channel, p->pid, process_output_buffer + carryover, readmax);
 	    }
-	  else if (delay > 0 && nbytes == readmax - buffered)
+	  else
 	    {
-	      delay -= READ_OUTPUT_DELAY_INCREMENT;
-	      if (delay == 0)
-		process_output_delay_count--;
-	    }
-	  p->read_output_delay = delay;
-	  if (delay)
-	    {
-	      p->read_output_skip = 1;
-	      process_output_skip = 1;
+	      nbytes = emacs_read(channel, process_output_buffer + carryover, readmax);
 	    }
 	}
-      nbytes += buffered;
-      nbytes += buffered && nbytes <= 0;
+
+      if (nbytes > 0 && p->adaptive_read_buffering)
+        {
+          int delay = p->read_output_delay;
+          if (nbytes < 256)
+            {
+              if (delay < READ_OUTPUT_DELAY_MAX_MAX)
+                {
+                  if (delay == 0)
+                    process_output_delay_count++;
+                  delay += READ_OUTPUT_DELAY_INCREMENT * 2;
+                }
+            }
+          else if (delay > 0 && nbytes == readmax - carryover)
+            {
+              delay -= READ_OUTPUT_DELAY_INCREMENT;
+              if (delay == 0)
+                process_output_delay_count--;
+            }
+          p->read_output_delay = delay;
+          if (delay)
+            {
+              p->read_output_skip = 1;
+              process_output_skip = 1;
+            }
+        }
     }
 
   p->decoding_carryover = 0;
@@ -6201,8 +7024,7 @@ read_process_output (Lisp_Object proc, int channel)
      buffer, and many callers of accept-process-output, sit-for, and
      friends don't expect current-buffer to be changed from under them.  */
   record_unwind_current_buffer ();
-
-  read_and_dispose_of_process_output (p, chars, nbytes, coding);
+  read_and_dispose_of_process_output (p, process_output_buffer, nbytes, coding);
 
   /* Handling the process output should not deactivate the mark.  */
   Vdeactivate_mark = odeactivate;
@@ -7032,15 +7854,20 @@ If PROCESS is a network or serial or pipe connection, inhibit handling
 of incoming traffic.  */)
   (Lisp_Object process, Lisp_Object current_group)
 {
-  if (PROCESSP (process) && (NETCONN_P (process) || SERIALCONN_P (process)
+  struct Lisp_Process *p = NULL;
+  if (PROCESSP(process))
+    {
+      p = XPROCESS (process);
+    }
+
+  if (p != NULL && (NETCONN_P (process) || SERIALCONN_P (process)
 			     || PIPECONN_P (process)))
     {
-      struct Lisp_Process *p;
 
-      p = XPROCESS (process);
       if (NILP (p->command)
 	  && p->infd >= 0)
-	delete_read_fd (p->infd);
+	 delete_read_fd (p->infd);
+
       pset_command (p, Qt);
       return process;
     }
@@ -7049,6 +7876,11 @@ of incoming traffic.  */)
 #else
   process_send_signal (process, SIGTSTP, current_group, 0);
 #endif
+  if (p != NULL && p->infd >= 0 && !p->is_non_blocking_client && !p->is_server)
+    {
+      process_output_consumer_ignore_fd(p->infd, p->pid);
+    }
+
   return process;
 }
 
@@ -7059,7 +7891,12 @@ If PROCESS is a network or serial process, resume handling of incoming
 traffic.  */)
   (Lisp_Object process, Lisp_Object current_group)
 {
-  if (PROCESSP (process) && (NETCONN_P (process) || SERIALCONN_P (process)
+  struct Lisp_Process *p = NULL;
+  if (PROCESSP(process))
+    {
+      p = XPROCESS (process);
+    }
+  if (p != NULL && (NETCONN_P (process) || SERIALCONN_P (process)
 			     || PIPECONN_P (process)))
     {
       struct Lisp_Process *p;
@@ -7078,6 +7915,9 @@ traffic.  */)
 	  tcflush (p->infd, TCIFLUSH);
 #endif /* not WINDOWSNT */
 	}
+
+      process_output_consumer_unignore_fd(p->infd, p->pid);
+
       pset_command (p, Qnil);
       return process;
     }
@@ -7086,6 +7926,11 @@ traffic.  */)
 #else
     error ("No SIGCONT support");
 #endif
+
+    if (p != NULL)
+      {
+	process_output_consumer_unignore_fd(p->infd, p->pid);
+      }
   return process;
 }
 
@@ -7483,7 +8328,10 @@ handle_child_signal (int sig)
 
 	      /* clear_desc_flag avoids a compiler bug in Microsoft C.  */
 	      if (clear_desc_flag)
-		delete_read_fd (p->infd);
+		{
+		  process_output_consumer_ignore_fd(p->infd, p->pid);
+		  delete_read_fd (p->infd);
+		}
 	    }
 	}
     }
@@ -8417,6 +9265,7 @@ void
 init_process_emacs (int sockfd)
 {
 #ifdef subprocesses
+  process_output_producer_thread_init();
   int i;
 
   inhibit_sentinels = 0;
