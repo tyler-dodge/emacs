@@ -1103,7 +1103,7 @@ aligned_alloc (size_t alignment, size_t size)
 
 /* Internal data structures and constants.  */
 
-#define ABLOCKS_SIZE 16
+#define ABLOCKS_SIZE 1024
 
 /* An aligned block of memory.  */
 struct ablock
