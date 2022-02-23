@@ -266,13 +266,628 @@ static bool keyboard_bit_set (fd_set *);
 #endif
 static void deactivate_process (Lisp_Object);
 static int status_notify (struct Lisp_Process *, struct Lisp_Process *);
-static int read_process_output (Lisp_Object, int);
+static intmax_t read_process_output (Lisp_Object, int);
 static void create_pty (Lisp_Object);
 static void exec_sentinel (Lisp_Object, Lisp_Object);
 
-static Lisp_Object
-network_lookup_address_info_1 (Lisp_Object host, const char *service,
-                               struct addrinfo *hints, struct addrinfo **res);
+static const intmax_t MAX_PROCESS_OUTPUT_BUFFER_SIZE = PROCESS_OUTPUT_MAX;
+
+struct process_output_window {
+  int fd;
+  struct timespec next_window;
+  int iterations;
+  intmax_t bytes;
+  intmax_t output_max;
+  struct timespec time;
+};
+
+struct process_output_buffer {
+  pid_t pid;
+  int channel;
+  int fd;
+  bool completed;
+  intmax_t buffer_size;
+  int error;
+  int output_tick;
+  bool released;
+  char buffer[MAX_PROCESS_OUTPUT_BUFFER_SIZE + 1];
+  struct process_output_window window;
+  struct process_output_buffer * prev;
+  struct process_output_buffer * next;
+};
+
+struct timespec output_window_timeslice;
+struct timespec output_window_slow_timeslice;
+struct timespec output_window_fast_timeslice;
+struct timespec output_window_period;
+
+bool output_window_exceeds_threshold(struct process_output_window * window) {
+  return false;
+  if (window->iterations > 10 || window->bytes > window->output_max) {
+    return true;
+  }
+  return false;
+}
+
+void output_window_reset(struct process_output_window * window) {
+  struct timespec now = current_timespec();
+  window->iterations = 0;
+  window->bytes = 0;
+  window->next_window = timespec_add(now, output_window_period);
+  window->time = make_timespec(0, 0);
+  return;
+  if (timespec_cmp(window->time, output_window_slow_timeslice) >= 0) {
+    window->output_max = 1024;
+    printf("Scaling down fast %ld\n", window->output_max);
+  } if (timespec_cmp(window->time, output_window_timeslice) >= 0) {
+    window->output_max /= 1.5;
+    window->output_max = max(window->output_max, 1024);
+    printf("Scaling down %ld\n", window->output_max);
+  } else if (timespec_cmp(window->time, output_window_period) >= 0) {
+    // Do nothing
+  } else if (timespec_cmp(window->time, output_window_fast_timeslice) >= 0) {
+    window->output_max *= 1.5;
+    window->output_max = min(window->output_max, PROCESS_OUTPUT_MAX);
+    printf("Scaling up %ld\n", window->output_max);
+  } else if (timespec_cmp(window->time, make_timespec(0, 0)) > 0) {
+    if ( window->output_max > 1024 * 1024) {
+      window->output_max *= 100;
+    } else {
+      window->output_max *= 5;
+    }
+    window->output_max = min(window->output_max, PROCESS_OUTPUT_MAX);
+    printf("Scaling up fast %ld\n", window->output_max);
+  }
+}
+
+static struct process_output_buffer * process_buffers = NULL;
+static pthread_mutex_t process_output_mutex;
+static pthread_mutex_t process_output_window_mutex;
+
+static int process_output_ready_fd[2] = { -1, -1 };
+static bool process_output_ready_fd_has_notification = false;
+static int process_output_tick = 0;
+
+static int process_output_notify_fd[2] = { -1, -1 };
+static bool process_output_notify_has_notification = false;
+static int process_output_ready_count = 0;
+
+static fd_set process_output_ready_fds;
+
+int process_output_ready_read_fd() {
+  return process_output_ready_fd[0];
+}
+
+int process_output_ready_write_fd() {
+  return process_output_ready_fd[1];
+}
+
+int process_output_notify_read_fd() {
+  return process_output_notify_fd[0];
+}
+
+int process_output_notify_write_fd() {
+  return process_output_notify_fd[1];
+}
+
+int process_output_ready_fd_drain() {
+  if (!process_output_ready_fd_has_notification) {
+    return 0;
+  }
+  char throwaway[1024];
+  int output = emacs_read(process_output_ready_read_fd(), throwaway, 1024);
+  if (output == -1) {
+    if (!would_block(errno)) {
+      emacs_perror("Failed to drain ready fd");
+    }
+  }
+
+  if (output > 0) {
+    process_output_ready_fd_has_notification = false;
+  }
+  return output;
+}
+
+void process_output_mutex_lock() {
+  int xerrno = errno;
+  while (pthread_mutex_lock(&process_output_mutex) != 0);
+  errno = xerrno;
+}
+
+void process_output_mutex_unlock() {
+  int xerrno = errno;
+  while (pthread_mutex_unlock(&process_output_mutex) != 0);
+  errno = xerrno;
+}
+
+void process_output_window_mutex_lock() {
+  int xerrno = errno;
+  while (pthread_mutex_lock(&process_output_window_mutex) != 0);
+  errno = xerrno;
+}
+
+void process_output_window_mutex_unlock() {
+  int xerrno = errno;
+  while (pthread_mutex_unlock(&process_output_window_mutex) != 0);
+  errno = xerrno;
+}
+
+struct process_output_buffer * get_process_output_buffer(int channel, int pid) {
+  struct process_output_buffer * buffer = process_buffers;
+  while (buffer != NULL) {
+    if (buffer->channel == channel && buffer->pid == pid && !buffer->released) {
+      return buffer;
+    }
+    buffer = buffer->next;
+  }
+  return NULL;
+}
+
+
+int process_output_get_ready_fd() {
+  int count;
+  struct process_output_buffer * buffer = process_buffers;
+  int fd = -1;
+  bool has_output = false;
+  struct timespec now = current_timespec();
+
+  do {
+    has_output = false;
+    while (fd == -1 && buffer != NULL) {
+      if (timespec_cmp(now, buffer->window.next_window) >= 0) {
+        output_window_reset(&buffer->window);
+      }
+      if ((buffer->buffer_size > 0 && !output_window_exceeds_threshold(&buffer->window)) || buffer->completed) {
+        if (!buffer->released && buffer->output_tick != process_output_tick) {
+          fd = buffer->fd;
+        }
+        has_output = true;
+      }
+      buffer = buffer->next;
+    }
+    if (fd == -1 && has_output) {
+      process_output_tick++;
+    }
+  } while(fd == -1 && has_output);
+  if (fd == -1) {
+    process_output_ready_fd_drain();
+  }
+  return fd;
+}
+
+int copy_process_output_ready_fd_set(struct fd_set * destination) {
+  process_output_window_mutex_lock();
+  FD_COPY(&process_output_ready_fds, destination);
+  int count = process_output_ready_count;
+  process_output_window_mutex_unlock();
+  return count;
+}
+
+int locked_process_output_get_ready_fd() {
+  int xerrno = errno;
+  process_output_mutex_lock();
+  int output = process_output_get_ready_fd();
+  process_output_mutex_unlock();
+  errno = xerrno;
+  return output;
+}
+
+void process_output_buffer_clear_ready_fd(struct process_output_buffer * buffer) {
+  int fd = buffer->fd;
+  int xerrno = errno;
+  if (fd < 0) {
+    error("Unexpected fd < 0\n");
+    return;
+  }
+  process_output_window_mutex_lock();
+  if (FD_ISSET(fd, &process_output_ready_fds)) {
+    process_output_ready_count--;
+    FD_CLR(fd, &process_output_ready_fds);
+  }
+  process_output_window_mutex_unlock();
+  errno = xerrno;
+}
+
+void process_output_buffer_set_ready_fd(struct process_output_buffer * buffer) {
+  int fd = buffer->fd;
+  if (fd < 0) {
+    error("Unexpected fd < 0\n");
+    return;
+  }
+  int xerrno = errno;
+  process_output_window_mutex_lock();
+  if (!FD_ISSET(fd, &process_output_ready_fds)) {
+    process_output_ready_count++;
+    FD_SET(fd, &process_output_ready_fds);
+  }
+  process_output_window_mutex_unlock();
+  errno = xerrno;
+}
+
+
+struct process_output_window global_output_window;
+
+bool global_output_window_exceeded_threshold() {
+  /* if (global_output_window.bytes > MAX_PROCESS_OUTPUT_BUFFER_SIZE) { */
+  /*   return true; */
+  /* } */
+  return false;
+}
+
+void global_output_window_check() {
+  struct timespec now = current_timespec();
+  process_output_window_mutex_lock();
+  if (timespec_cmp(now, global_output_window.next_window) > 0) {
+    output_window_reset(&global_output_window);
+  }
+  process_output_window_mutex_unlock();
+}
+
+void global_output_window_add_iteration(int bytes_read) {
+  int xerrno = errno;
+  process_output_window_mutex_lock();
+  global_output_window.bytes += bytes_read;
+  global_output_window.iterations++;
+  process_output_window_mutex_unlock();
+}
+
+bool locked_global_output_window_exceeded_threshold() {
+  bool output;
+  int xerrno = errno;
+  process_output_window_mutex_lock();
+  output = global_output_window_exceeded_threshold();
+  process_output_window_mutex_unlock();
+  errno = xerrno;
+  return output;
+}
+
+int
+process_output_setup_for_select() {
+  global_output_window_check();
+  bool exceeded_window = locked_global_output_window_exceeded_threshold();
+  process_output_mutex_lock();
+  int fd = process_output_get_ready_fd();
+  if (fd == -1 || exceeded_window) {
+    process_output_ready_fd_drain();
+  }
+  process_output_mutex_unlock();
+  return fd;
+}
+
+void
+process_output_add_time_window(int channel, int pid, struct timespec * time) {
+  process_output_mutex_lock();
+  struct process_output_buffer * buffer = get_process_output_buffer(channel, pid);
+  if (buffer != NULL) {
+    //We only want to care about worst case scenario
+    if (timespec_cmp(*time, buffer->window.time) > 0) {
+      buffer->window.time = *time;
+    }
+  }
+  process_output_mutex_unlock();
+}
+
+ptrdiff_t
+process_output_read(int channel, int pid, void * buf, ptrdiff_t nbyte) {
+  bool exceeded_global_window = locked_global_output_window_exceeded_threshold();
+  process_output_mutex_lock();
+  struct process_output_buffer * buffer = get_process_output_buffer(channel, pid);
+  if (buffer == NULL) {
+    process_output_mutex_unlock();
+    return 0;
+  }
+  //bool exceeded_process_window = output_window_exceeds_threshold(&buffer->window);
+
+  if (!buffer->completed && (exceeded_global_window)) {
+    process_output_mutex_unlock();
+    errno = EAGAIN;
+    return -1;
+  }
+
+  struct timespec now = current_timespec();
+  char throwaway[1024];
+  intmax_t buffer_size = 0;
+  bool larger_than_buffer = buffer->buffer_size > nbyte;
+  if (buffer->buffer_size > 0) {
+    buffer->window.iterations++;
+  }
+  if (larger_than_buffer) {
+    memcpy(buf, (char *)buffer->buffer, nbyte);
+    const intmax_t newSize = buffer->buffer_size - nbyte;
+    memcpy((char *)buffer->buffer, (char *)buffer->buffer + nbyte, newSize);
+    buffer->buffer_size = newSize;
+    buffer_size = nbyte;
+  } else if (buffer->buffer_size > 0) {
+    buffer_size = buffer->buffer_size;
+    memcpy(buf, (char *)buffer->buffer, buffer->buffer_size);
+    buffer->buffer_size = 0;
+  }
+
+  buffer->window.bytes += buffer_size;
+  buffer->output_tick = process_output_tick;
+
+  const bool completed = buffer->completed;
+  const int fd = buffer->fd;
+
+  if (buffer_size == 0) {
+    if (completed) {
+      if (!process_output_notify_has_notification) {
+        if (emacs_write(process_output_notify_write_fd(), &throwaway, 1) > 0) {
+          process_output_notify_has_notification = true;
+        }
+      }
+      buffer->released = true;
+    } else {
+      buffer->error = 0;
+    }
+    process_output_buffer_clear_ready_fd(buffer);
+  } else {
+    if (!process_output_notify_has_notification) {
+      if (emacs_write(process_output_notify_write_fd(), &throwaway, 1) > 0) {
+        process_output_notify_has_notification = true;
+      }
+    }
+  }
+  const int saved_errno = buffer->error;
+
+  process_output_mutex_unlock();
+  global_output_window_add_iteration(buffer_size);
+
+  if (buffer_size == 0) {
+    if (completed && saved_errno == 0) {
+      return 0;
+    }
+    if (saved_errno == 0) {
+      errno = EAGAIN;
+    } else {
+      errno = saved_errno;
+    }
+    return -1;
+  }
+  return buffer_size;
+}
+
+void process_output_release_fd(int channel, int pid) {
+  if (channel < 0) {
+    return;
+  }
+  process_output_mutex_lock();
+  struct process_output_buffer * buffer = get_process_output_buffer(channel, pid);
+  if (buffer != NULL) {
+    buffer->released = true;
+    buffer->completed = true;
+  }
+  process_output_mutex_unlock();
+}
+
+void process_output_track_fd(int channel, int pid, int fd) {
+  if (fd < 0) {
+    printf("Skipping process with negative pid / fd\n");
+    return;
+  }
+  process_output_mutex_lock();
+
+  if (get_process_output_buffer(channel, pid) != NULL) {
+    process_output_mutex_unlock();
+    return;
+  }
+
+  struct process_output_buffer * buffer = xmalloc(sizeof(struct process_output_buffer));
+  buffer->pid = pid;
+  buffer->fd = fd;
+  buffer->error = 0;
+  buffer->buffer_size = 0;
+  buffer->channel = channel;
+  buffer->completed = false;
+  buffer->released = false;
+  buffer->output_tick = process_output_tick;
+  buffer->prev = NULL;
+  buffer->window.output_max = PROCESS_OUTPUT_MAX;
+  buffer->window.time = make_timespec(0, 0);
+  output_window_reset(&buffer->window);
+  buffer->window.fd = buffer->fd;
+
+  buffer->next = process_buffers;
+  bool first_buffer = process_buffers == NULL;
+  if (!first_buffer) {
+    process_buffers->prev = buffer;
+  }
+
+  process_buffers = buffer;
+  char throwaway = '\n';
+  if (!process_output_notify_has_notification) {
+    if (emacs_write(process_output_notify_write_fd(), &throwaway, 1) > 0) {
+      process_output_notify_has_notification = true;
+    }
+  }
+  process_output_mutex_unlock();
+}
+
+static char process_output_consumer_copy_buffer[MAX_PROCESS_OUTPUT_BUFFER_SIZE];
+
+void * process_output_consumer_thread(void * args) {
+  const long BUFFER_TIMEOUT = 1;
+  fd_set ready_fds;
+  fd_set outputting_fds;
+  fd_set tracked_fds;
+  struct process_output_window output_window;
+  output_window.output_max = MAX_PROCESS_OUTPUT_BUFFER_SIZE;
+  output_window_reset(&output_window);
+
+  FD_ZERO(&ready_fds);
+  FD_ZERO(&outputting_fds);
+  FD_ZERO(&tracked_fds);
+  while (1) {
+    struct timespec now = current_timespec();
+    if (timespec_cmp(now, output_window.next_window) > 0) {
+      output_window_reset(&output_window);
+    } else if (output_window.iterations > 1000) {
+      struct timespec timeout = timespec_sub(output_window.next_window, now);
+      nanosleep(&timeout, NULL);
+    }
+    output_window.iterations++;
+    fd_set fds;
+    FD_ZERO(&fds);
+    int notify_fd = process_output_notify_read_fd();
+    FD_SET(notify_fd, &fds);
+
+    bool back_pressure = locked_global_output_window_exceeded_threshold();
+    process_output_mutex_lock();
+    if (FD_ISSET(notify_fd, &ready_fds)) {
+      if (emacs_read(notify_fd, process_output_consumer_copy_buffer, MAX_PROCESS_OUTPUT_BUFFER_SIZE) > 0) {
+        process_output_notify_has_notification = false;
+      }
+    }
+
+    struct process_output_buffer * buffer = process_buffers;
+    int maxFd = notify_fd;
+    int readingCount = 0;
+    bool has_output = false;
+    struct timespec buffer_timeout = make_timespec(0, 100000000);
+    while (buffer != NULL) {
+      if (timespec_cmp(now, buffer->window.next_window) >= 0) {
+        output_window_reset(&buffer->window);
+      }
+      if (buffer->completed || buffer->buffer_size >= buffer->window.output_max) {
+        struct process_output_buffer * next = buffer->next;
+        if (buffer->released) {
+          FD_CLR(buffer->fd, &tracked_fds);
+          if (buffer == process_buffers) {
+            process_buffers = buffer->next;
+          }
+          if (buffer->prev != NULL) {
+            buffer->prev->next = buffer->next;
+          }
+          if (buffer->next != NULL) {
+            buffer->next->prev = buffer->prev;
+          }
+          xfree((void *) buffer);
+        } else {
+          has_output = true;
+          process_output_buffer_set_ready_fd(buffer);
+        }
+        buffer = next;
+        continue;
+      }
+
+
+      const int fd = buffer->fd;
+      if (fd > maxFd) {
+        maxFd = fd;
+      }
+      FD_SET(fd, &fds);
+      const intmax_t outputSize = min(MAX_PROCESS_OUTPUT_BUFFER_SIZE, buffer->window.output_max) - buffer->buffer_size;
+      intmax_t updatedSize;
+      if (FD_ISSET(fd, &ready_fds) || FD_ISSET(fd, &outputting_fds) || !FD_ISSET(fd, &tracked_fds)) {
+        process_output_mutex_unlock();
+        FD_SET(fd, &tracked_fds);
+        updatedSize = emacs_read(fd, process_output_consumer_copy_buffer, outputSize);
+        if (updatedSize > 0) {
+          FD_SET(fd, &outputting_fds);
+        } else {
+          FD_CLR(fd, &outputting_fds);
+        }
+        process_output_mutex_lock();
+      } else {
+        updatedSize = -1;
+        errno = EAGAIN;
+      }
+
+      if (updatedSize > 0) {
+        // buffer_size should only decrease between locks so this'll be fine.
+        memcpy(buffer->buffer + buffer->buffer_size, process_output_consumer_copy_buffer, updatedSize);
+      }
+
+      if (errno != 0) {
+        buffer->error = errno;
+      } else {
+        buffer->error = 0;
+      }
+      if (updatedSize > 0) {
+        buffer->buffer_size += updatedSize;
+      }
+
+      if (updatedSize == 0 || (updatedSize == -1 && !would_block(buffer->error))) {
+        buffer->completed = true;
+      }
+
+      if (buffer->buffer_size > 0 || buffer->completed) {
+        if (buffer->completed || !output_window_exceeds_threshold(&buffer->window)) {
+          has_output = true;
+        }
+        readingCount++;
+        process_output_buffer_set_ready_fd(buffer);
+      }
+
+      buffer = buffer->next;
+    }
+    if (!back_pressure && has_output) {
+      char throwaway = '\n';
+      if (!process_output_ready_fd_has_notification) {
+        if (emacs_write(process_output_ready_write_fd(), &throwaway, 1) > 0) {
+          process_output_ready_fd_has_notification = true;
+        }
+      }
+    } else {
+      process_output_ready_fd_drain();
+    }
+    process_output_mutex_unlock();
+
+    struct timespec select_timeout = readingCount == 0 ? buffer_timeout : make_timespec(0, 0);
+
+    pselect(maxFd + 1, &fds, NULL, NULL, &select_timeout, NULL);
+    FD_COPY(&fds, &ready_fds);
+  }
+  return NULL;
+}
+
+void start_process_output_consumer_thread() {
+  output_window_slow_timeslice =
+    make_timespec(0, 500000000);
+  output_window_timeslice =
+    make_timespec(0, 100000000);
+  output_window_fast_timeslice =
+    make_timespec(0, 10000000);
+  output_window_period =
+    make_timespec(0, 100000000);
+
+  FD_ZERO(&process_output_ready_fds);
+  pthread_mutexattr_t attr;
+  pthread_mutexattr_init(&attr);
+  pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+  if (pthread_mutex_init( &process_output_mutex, NULL) != 0)  {
+    emacs_perror("Failed to start output consumer mutex");
+  }
+  if (pthread_mutex_init( &process_output_window_mutex, NULL) != 0)  {
+    emacs_perror("Failed to start output consumer mutex");
+  }
+  if (pipe(process_output_notify_fd) != 0) {
+    emacs_perror("Failed to create not empty fd");
+  }
+  if (fcntl(process_output_notify_fd[1], F_SETFL, O_NONBLOCK) != 0) {
+    emacs_perror("Failed to setup not empty write fd");
+  }
+  if (fcntl(process_output_notify_fd[0], F_SETFL, O_NONBLOCK) != 0) {
+    emacs_perror("Failed to setup not empty read fd");
+  }
+  if (pipe(process_output_ready_fd) != 0) {
+    emacs_perror("Failed to create not empty fd");
+  }
+  if (fcntl(process_output_ready_fd[1], F_SETFL, O_NONBLOCK) != 0) {
+    emacs_perror("Failed to setup not empty write fd");
+  }
+  if (fcntl(process_output_ready_fd[0], F_SETFL, O_NONBLOCK) != 0) {
+    emacs_perror("Failed to setup not empty read fd");
+  }
+  pthread_t process_buffer_thread;
+
+  if (pthread_create(&process_buffer_thread, NULL, &process_output_consumer_thread, NULL) != 0) {
+    emacs_perror("Failed to create process output consumer");
+  }
+ output_window_reset(&global_output_window);
+ global_output_window.time = make_timespec(0, 0);
+  global_output_window.fd = -1;
+}
 
 /* Number of bits set in connect_wait_mask.  */
 static int num_pending_connects;
@@ -2170,8 +2785,10 @@ create_process (Lisp_Object process, char **new_argv, Lisp_Object current_dir)
   pset_status (p, Qrun);
 
   if (!EQ (p->command, Qt)
-      && !EQ (p->filter, Qt))
+    && !EQ (p->filter, Qt)) {
     add_process_read_fd (inchannel);
+    process_output_track_fd(p->infd, p->pid, p->infd);
+  }
 
   specpdl_ref count = SPECPDL_INDEX ();
 
@@ -2238,6 +2855,7 @@ create_process (Lisp_Object process, char **new_argv, Lisp_Object current_dir)
 	  struct Lisp_Process *pp = XPROCESS (p->stderrproc);
 	  close_process_fd (&pp->open_fd[SUBPROCESS_STDOUT]);
 	}
+      process_output_track_fd(p->infd, p->pid, p->infd);
     }
 }
 
@@ -2295,6 +2913,7 @@ create_pty (Lisp_Object process)
     }
 
   p->pid = -2;
+  process_output_track_fd(p->infd, p->pid, p->infd);
 }
 
 DEFUN ("make-pipe-process", Fmake_pipe_process, Smake_pipe_process,
@@ -3133,8 +3752,10 @@ usage:  (make-serial-process &rest ARGS)  */)
   eassert (! p->pty_flag);
 
   if (!EQ (p->command, Qt)
-      && !EQ (p->filter, Qt))
+    && !EQ (p->filter, Qt)) {
     add_process_read_fd (fd);
+    process_output_track_fd(p->infd, p->pid, p->infd);
+  }
 
   update_process_mark (p);
 
@@ -3683,6 +4304,46 @@ connect_network_socket (Lisp_Object proc, Lisp_Object addrinfos,
   unbind_to (count, Qnil);
 }
 
+static Lisp_Object
+network_lookup_address_info_1 (Lisp_Object host, const char *service,
+                               struct addrinfo *hints, struct addrinfo **res)
+{
+  Lisp_Object msg = Qt;
+  int ret;
+
+  if (STRING_MULTIBYTE (host) && SBYTES (host) != SCHARS (host))
+    error ("Non-ASCII hostname %s detected, please use puny-encode-domain",
+           SSDATA (host));
+
+#ifdef WINDOWSNT
+  /* Ensure socket support is loaded if available.  */
+  init_winsock (TRUE);
+#endif
+
+  ret = getaddrinfo (SSDATA (host), service, hints, res);
+  if (ret)
+    {
+      if (service == NULL)
+        service = "0";
+#ifdef HAVE_GAI_STRERROR
+      synchronize_system_messages_locale ();
+      char const *str = gai_strerror (ret);
+      if (! NILP (Vlocale_coding_system))
+        str = SSDATA (code_convert_string_norecord
+                      (build_string (str), Vlocale_coding_system, 0));
+      AUTO_STRING (format, "%s/%s %s");
+      msg = CALLN (Fformat, format, host, build_string (service),
+		   build_string (str));
+#else
+      AUTO_STRING (format, "%s/%s getaddrinfo error %d");
+      msg = CALLN (Fformat, format, host, build_string (service),
+		   make_int (ret));
+#endif
+    }
+   return msg;
+}
+
+
 /* Create a network stream/datagram client/server process.  Treated
    exactly like a normal process when reading and writing.  Primary
    differences are in status display and process deletion.  A network
@@ -4189,8 +4850,10 @@ usage: (make-network-process &rest ARGS)  */)
     p->backlog = XFIXNUM (server);
 
   /* :nowait BOOL */
-  if (!p->is_server && socktype != SOCK_DGRAM && nowait)
+  if (!p->is_server && socktype != SOCK_STREAM && socktype != SOCK_DGRAM && nowait) {
     p->is_non_blocking_client = true;
+    process_output_track_fd(p->infd, p->pid, p->infd);
+  }
 
   bool postpone_connection = false;
 #ifdef HAVE_GETADDRINFO_A
@@ -4584,44 +5247,6 @@ Data that is unavailable is returned as nil.  */)
 #endif
 }
 
-static Lisp_Object
-network_lookup_address_info_1 (Lisp_Object host, const char *service,
-                               struct addrinfo *hints, struct addrinfo **res)
-{
-  Lisp_Object msg = Qt;
-  int ret;
-
-  if (STRING_MULTIBYTE (host) && SBYTES (host) != SCHARS (host))
-    error ("Non-ASCII hostname %s detected, please use puny-encode-domain",
-           SSDATA (host));
-
-#ifdef WINDOWSNT
-  /* Ensure socket support is loaded if available.  */
-  init_winsock (TRUE);
-#endif
-
-  ret = getaddrinfo (SSDATA (host), service, hints, res);
-  if (ret)
-    {
-      if (service == NULL)
-        service = "0";
-#ifdef HAVE_GAI_STRERROR
-      synchronize_system_messages_locale ();
-      char const *str = gai_strerror (ret);
-      if (! NILP (Vlocale_coding_system))
-        str = SSDATA (code_convert_string_norecord
-                      (build_string (str), Vlocale_coding_system, 0));
-      AUTO_STRING (format, "%s/%s %s");
-      msg = CALLN (Fformat, format, host, build_string (service),
-		   build_string (str));
-#else
-      AUTO_STRING (format, "%s/%s getaddrinfo error %d");
-      msg = CALLN (Fformat, format, host, build_string (service),
-		   make_int (ret));
-#endif
-    }
-   return msg;
-}
 
 DEFUN ("network-lookup-address-info", Fnetwork_lookup_address_info,
        Snetwork_lookup_address_info, 1, 2, 0,
@@ -6002,6 +6627,10 @@ read_and_dispose_of_process_output (struct Lisp_Process *p, char *chars,
 				    ssize_t nbytes,
 				    struct coding_system *coding);
 
+
+static const intmax_t READ_PROCESS_OUTPUT_MAX = 1024 * 1024 * 5;
+char process_output_buffer[READ_PROCESS_OUTPUT_MAX];
+
 /* Read pending output from the process channel,
    starting with our buffered-ahead character if we have one.
    Yield number of decoded characters read,
@@ -6013,8 +6642,7 @@ read_and_dispose_of_process_output (struct Lisp_Process *p, char *chars,
 
    The characters read are decoded according to PROC's coding-system
    for decoding.  */
-
-static int
+static intmax_t
 read_process_output (Lisp_Object proc, int channel)
 {
   ssize_t nbytes;
@@ -6046,48 +6674,47 @@ read_process_output (Lisp_Object proc, int channel)
     }
   else
 #endif
+
     {
-      bool buffered = proc_buffered_char[channel] >= 0;
-      if (buffered)
-	{
-	  chars[carryover] = proc_buffered_char[channel];
-	  proc_buffered_char[channel] = -1;
-	}
 #ifdef HAVE_GNUTLS
       if (p->gnutls_p && p->gnutls_state)
-	nbytes = emacs_gnutls_read (p, chars + carryover + buffered,
-				    readmax - buffered);
+        nbytes = emacs_gnutls_read (p, process_output_buffer + carryover,
+            readmax);
       else
 #endif
-	nbytes = emacs_read (channel, chars + carryover + buffered,
-			     readmax - buffered);
+        {
+          if (p->is_server || (NETCONN1_P(p))) {
+            nbytes = emacs_read(channel, process_output_buffer + carryover, readmax);
+          } else {
+            nbytes = process_output_read(channel, p->pid, process_output_buffer + carryover, readmax);
+          }
+        }
+
       if (nbytes > 0 && p->adaptive_read_buffering)
-	{
-	  int delay = p->read_output_delay;
-	  if (nbytes < 256)
-	    {
-	      if (delay < READ_OUTPUT_DELAY_MAX_MAX)
-		{
-		  if (delay == 0)
-		    process_output_delay_count++;
-		  delay += READ_OUTPUT_DELAY_INCREMENT * 2;
-		}
-	    }
-	  else if (delay > 0 && nbytes == readmax - buffered)
-	    {
-	      delay -= READ_OUTPUT_DELAY_INCREMENT;
-	      if (delay == 0)
-		process_output_delay_count--;
-	    }
-	  p->read_output_delay = delay;
-	  if (delay)
-	    {
-	      p->read_output_skip = 1;
-	      process_output_skip = 1;
-	    }
-	}
-      nbytes += buffered;
-      nbytes += buffered && nbytes <= 0;
+        {
+          int delay = p->read_output_delay;
+          if (nbytes < 256)
+            {
+              if (delay < READ_OUTPUT_DELAY_MAX_MAX)
+                {
+                  if (delay == 0)
+                    process_output_delay_count++;
+                  delay += READ_OUTPUT_DELAY_INCREMENT * 2;
+                }
+            }
+          else if (delay > 0 && nbytes == readmax - carryover)
+            {
+              delay -= READ_OUTPUT_DELAY_INCREMENT;
+              if (delay == 0)
+                process_output_delay_count--;
+            }
+          p->read_output_delay = delay;
+          if (delay)
+            {
+              p->read_output_skip = 1;
+              process_output_skip = 1;
+            }
+        }
     }
 
   p->decoding_carryover = 0;
@@ -6116,8 +6743,11 @@ read_process_output (Lisp_Object proc, int channel)
      buffer, and many callers of accept-process-output, sit-for, and
      friends don't expect current-buffer to be changed from under them.  */
   record_unwind_current_buffer ();
+  struct timespec start = current_timespec();
+  read_and_dispose_of_process_output (p, process_output_buffer, nbytes, coding);
+  struct timespec time = timespec_sub(current_timespec(), start);
+  process_output_add_time_window(channel, p->pid, &time);
 
-  read_and_dispose_of_process_output (p, chars, nbytes, coding);
 
   /* Handling the process output should not deactivate the mark.  */
   Vdeactivate_mark = odeactivate;
@@ -7504,11 +8134,11 @@ exec_sentinel (Lisp_Object proc, Lisp_Object reason)
 
 static int
 status_notify (struct Lisp_Process *deleting_process,
-	       struct Lisp_Process *wait_proc)
+    struct Lisp_Process *wait_proc)
 {
   Lisp_Object proc;
   Lisp_Object tail, msg;
-  int got_some_output = -1;
+  intmax_t got_some_output = -1;
 
   tail = Qnil;
   msg = Qnil;
@@ -7517,70 +8147,86 @@ status_notify (struct Lisp_Process *deleting_process,
      that we run, we get called again to handle their status changes.  */
   update_tick = process_tick;
 
+  fd_set ready_buffers;
+  FD_ZERO(&ready_buffers);
+  if (deleting_process != NULL || wait_proc != NULL) {
+    copy_process_output_ready_fd_set(&ready_buffers);
+ } else {
+    const int fd = locked_process_output_get_ready_fd();
+    if (fd >= 0) {
+      FD_SET(fd, &ready_buffers);
+    }
+  }
+
   FOR_EACH_PROCESS (tail, proc)
     {
       Lisp_Object symbol;
       register struct Lisp_Process *p = XPROCESS (proc);
+      const bool updated_tick = p->tick != p->update_tick;
 
-      if (p->tick != p->update_tick)
-	{
-	  p->update_tick = p->tick;
+      if ((p->infd != -1 && FD_ISSET(p->infd, &ready_buffers)) || updated_tick || NETCONN1_P(p))
+        {
+          p->update_tick = p->tick;
+          intmax_t nread = -1;
+          /* If process is still active, read any output that remains.  */
+          while (! EQ (p->filter, Qt)
+              && ! connecting_status (p->status)
+              && ! EQ (p->status, Qlisten)
+              /* Network or serial process not stopped:  */
+              && ! EQ (p->command, Qt)
+              && p->infd >= 0
+              && p != deleting_process)
+            {
+              nread = read_process_output (proc, p->infd);
+              if ((!wait_proc || wait_proc == XPROCESS (
+                                                        proc))
+                  && got_some_output < nread)
+                got_some_output = nread;
+              if (nread <= 0 || !updated_tick)
+                break;
+            }
 
-	  /* If process is still active, read any output that remains.  */
-	  while (! EQ (p->filter, Qt)
-		 && ! connecting_status (p->status)
-		 && ! EQ (p->status, Qlisten)
-		 /* Network or serial process not stopped:  */
-		 && ! EQ (p->command, Qt)
-		 && p->infd >= 0
-		 && p != deleting_process)
-	    {
-	      int nread = read_process_output (proc, p->infd);
-	      if ((!wait_proc || wait_proc == XPROCESS (proc))
-		  && got_some_output < nread)
-		got_some_output = nread;
-	      if (nread <= 0)
-		break;
-	    }
+          if (updated_tick || nread == 0) {
+              /* Get the text to use for the message.  */
+              if (p->raw_status_new)
+                  update_status (p);
+              msg = status_message (p);
 
-	  /* Get the text to use for the message.  */
-	  if (p->raw_status_new)
-	    update_status (p);
-	  msg = status_message (p);
+              /* If process is terminated, deactivate it or delete it.  */
+              symbol = p->status;
+              if (CONSP (p->status))
+                  symbol = XCAR (p->status);
 
-	  /* If process is terminated, deactivate it or delete it.  */
-	  symbol = p->status;
-	  if (CONSP (p->status))
-	    symbol = XCAR (p->status);
+              if (EQ (symbol, Qsignal) || EQ (symbol, Qexit)
+                      || EQ (symbol, Qclosed))
+              {
+                if (delete_exited_processes)
+                  remove_process (proc);
+                else
+                  deactivate_process (proc);
+              }
 
-	  if (EQ (symbol, Qsignal) || EQ (symbol, Qexit)
-	      || EQ (symbol, Qclosed))
-	    {
-	      if (delete_exited_processes)
-		remove_process (proc);
-	      else
-		deactivate_process (proc);
-	    }
-
-	  /* The actions above may have further incremented p->tick.
-	     So set p->update_tick again so that an error in the sentinel will
-	     not cause this code to be run again.  */
-	  p->update_tick = p->tick;
-	  /* Now output the message suitably.  */
-	  exec_sentinel (proc, msg);
-	  if (BUFFERP (p->buffer))
-	    /* In case it uses %s in mode-line-format.  */
-	    bset_update_mode_line (XBUFFER (p->buffer));
-	}
+            /* The actions above may have further incremented p->tick.
+               So set p->update_tick again so that an error in the sentinel will
+               not cause this code to be run again.  */
+            p->update_tick = p->tick;
+            /* Now output the message suitably.  */
+            exec_sentinel (proc, msg);
+            if (BUFFERP (p->buffer))
+              /* In case it uses %s in mode-line-format.  */
+              bset_update_mode_line (XBUFFER (p->buffer));
+          }
+        }
     } /* end for */
 
   return got_some_output;
 }
 
+
 DEFUN ("internal-default-process-sentinel", Finternal_default_process_sentinel,
-       Sinternal_default_process_sentinel, 2, 2, 0,
-       doc: /* Function used as default sentinel for processes.
-This inserts a status message into the process's buffer, if there is one.  */)
+    Sinternal_default_process_sentinel, 2, 2, 0,
+    doc: /* Function used as default sentinel for processes.
+            This inserts a status message into the process's buffer, if there is one.  */)
      (Lisp_Object proc, Lisp_Object msg)
 {
   Lisp_Object buffer, symbol;
@@ -8328,6 +8974,7 @@ void
 init_process_emacs (int sockfd)
 {
 #ifdef subprocesses
+  start_process_output_consumer_thread();
   int i;
 
   inhibit_sentinels = 0;

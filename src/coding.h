@@ -392,6 +392,7 @@ struct coding_detection_info
   int rejected;
 };
 
+static const intmax_t PROCESS_OUTPUT_MAX = 1024 * 1024 * 500;
 
 struct coding_system
 {
