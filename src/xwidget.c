@@ -3801,6 +3801,27 @@ is to completely loading its page.  */)
 
   return make_float (value);
 }
+#elif defined NS_IMPL_COCOA
+DEFUN ("xwidget-webkit-estimated-load-progress",
+       Fxwidget_webkit_estimated_load_progress, Sxwidget_webkit_estimated_load_progress,
+       1, 1, 0, doc: /* Get the estimated load progress of XWIDGET, a WebKit widget.
+Return a value ranging from 0.0 to 1.0, based on how close XWIDGET
+is to completely loading its page.  */)
+  (Lisp_Object xwidget)
+{
+  struct xwidget *xw;
+  double value;
+
+  CHECK_LIVE_XWIDGET (xwidget);
+  xw = XXWIDGET (xwidget);
+  CHECK_WEBKIT_WIDGET (xw);
+
+  block_input ();
+  value = nsxwidget_webkit_get_estimated_load_progress(xw);
+  unblock_input ();
+
+  return make_float (value);
+}
 #endif
 
 DEFUN ("xwidget-webkit-set-cookie-storage-file",
@@ -3905,6 +3926,8 @@ syms_of_xwidget (void)
 #ifdef USE_GTK
   defsubr (&Sxwidget_webkit_load_html);
   defsubr (&Sxwidget_webkit_back_forward_list);
+  defsubr (&Sxwidget_webkit_estimated_load_progress);
+#elif defined NS_IMPL_COCOA
   defsubr (&Sxwidget_webkit_estimated_load_progress);
 #endif
   defsubr (&Skill_xwidget);

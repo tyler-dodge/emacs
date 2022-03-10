@@ -340,6 +340,13 @@ nsxwidget_webkit_goto_history (struct xwidget *xw, int rel_pos)
   }
 }
 
+double
+nsxwidget_webkit_get_estimated_load_progress(struct xwidget *xw)
+{
+  XwWebView *xwWebView = (XwWebView *) xw->xwWidget;
+  return xwWebView.estimatedProgress;
+}
+
 void
 nsxwidget_webkit_zoom (struct xwidget *xw, double zoom_change)
 {
