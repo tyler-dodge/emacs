@@ -425,11 +425,14 @@ nsxwidget_webkit_execute_script (struct xwidget *xw, const char *script,
     }
 
   NSString *javascriptString = [NSString stringWithUTF8String:script];
-  [xwWebView evaluateJavaScript:javascriptString
+  [xwWebView callAsyncJavaScript:javascriptString
+                       arguments: @{}.mutableCopy
+                         inFrame: nil
+                    contentWorld: WKContentWorld.defaultClientWorld
               completionHandler:^(id result, NSError *error) {
       if (error)
         {
-          NSLog (@"evaluateJavaScript error : %@", error.localizedDescription);
+          NSLog (@"evaluateJavaScript error : %@, %@", error.localizedDescription, error.userInfo);
           NSLog (@"error script=%@", javascriptString);
         }
       else if (result && FUNCTIONP (fun))
