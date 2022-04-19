@@ -4248,10 +4248,9 @@ substitution.  SPEC-LIST is a list of char/value pairs used for
 	    ;; Set filter.  Prior Emacs 29.1, it doesn't work reliable
 	    ;; to provide it as `make-process' argument when filter is
 	    ;; t.  See Bug#51177.
-	    (when filter
-	      (set-process-filter p filter))
+            (set-process-filter p (dece-tramp-filter filter))
 
-	    (tramp-message v 6 "%s" (string-join (process-command p) " "))
+            (tramp-message v 6 "%s" (string-join (process-command p) " "))
 	    p))))))
 
 (defun tramp-handle-make-symbolic-link
@@ -4382,7 +4381,7 @@ support symbolic links."
 		(setq mode-line-process '(":%s"))
 		(unless (eq major-mode 'shell-mode)
 		  (shell-mode))
-		(set-process-filter p #'comint-output-filter)
+		(set-process-filter p (dece-tramp-filter #'comint-output-filter))
 		(set-process-sentinel p #'shell-command-sentinel)
 		(when error-file
 		  (add-function
