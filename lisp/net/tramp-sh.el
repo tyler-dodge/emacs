@@ -2746,41 +2746,7 @@ the result will be a local, non-Tramp, file name."
 
 (defun dece-tramp-filter (delegate)
   (lambda (proc string)
-    (let ((filtered-string
-           (--> string
-                (s-replace-regexp
-                 (rx ?\x1B "[" "K")
-                 "\n" it)
-                (s-replace-regexp (rx ?\x1B "[" "1C")
-                 " " it)
-                (s-replace-regexp
-                 (rx ?\x1B "["
-                     (seq (? ??) (* digit) (? ";") (* digit) (any ?K ?C ?h ?H ?l ?m)))
-                 "" it)
-                (s-replace-regexp (rx (| "‘" "’")) "'" it)
-                (s-replace-regexp (rx (not (any "#" " "))
-                                      (not (any "$" " "))
-                                      (group-n 1 (+ whitespace))
-                                      line-end)
-                                  "" it nil nil 1)
-                (s-replace-regexp (rx "#$"
-                                      (group-n 1 (+ whitespace))
-                                      line-end)
-                                  " " it nil nil 1)
-                (s-replace-regexp (rx line-start (+ whitespace)) ""  it)
-                )))
-    (-message filtered-string)
-      (if delegate
-          (funcall delegate filtered-string)
-        (when (buffer-live-p (process-buffer proc))
-          (with-current-buffer (process-buffer proc)
-            (let ((moving (= (point) (process-mark proc))))
-              (save-excursion
-                ;; Insert the text, advancing the process marker.
-                (goto-char (process-mark proc))
-                (insert filtered-string)
-                (set-marker (process-mark proc) (point)))
-              (if moving (goto-char (process-mark proc))))))))))
+    (ansi-color-for-comint-mode-filter proc string)))
 
 ;; We use BUFFER also as connection buffer during setup.  Because of
 ;; this, its original contents must be saved, and restored once
