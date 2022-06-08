@@ -2919,14 +2919,7 @@ create_process (Lisp_Object process, char **new_argv, Lisp_Object current_dir)
 
   p->pid = pid;
   if (pid >= 0)
-    {
-      p->alive = 1;
-      process_output_consumer_track_fd(p->infd, p->pid, p->infd);
-    }
-  if (EQ (p->filter, Qt))
-    {
-      process_output_consumer_ignore_fd(p->infd, p->pid);
-    }
+     p->alive = 1;
 
   /* Stop blocking in the parent.  */
   unblock_child_signal (&oldset);
@@ -2970,6 +2963,11 @@ create_process (Lisp_Object process, char **new_argv, Lisp_Object current_dir)
 	  struct Lisp_Process *pp = XPROCESS (p->stderrproc);
 	  close_process_fd (&pp->open_fd[SUBPROCESS_STDOUT]);
 	}
+      process_output_consumer_track_fd(p->infd, p->pid, p->infd);
+      if (EQ (p->filter, Qt))
+	{
+	  process_output_consumer_ignore_fd(p->infd, p->pid);
+	}
     }
 }
 
@@ -3012,7 +3010,6 @@ create_pty (Lisp_Object process)
       chan_process[pty_fd] = process;
       p->infd = pty_fd;
       p->outfd = pty_fd;
-      process_output_consumer_track_fd(p->infd, p->pid, p->infd);
 
       /* Previously we recorded the tty descriptor used in the subprocess.
 	 It was only used for getting the foreground tty process, so now
@@ -3024,6 +3021,7 @@ create_pty (Lisp_Object process)
       setup_process_coding_systems (process);
 
       add_process_read_fd (pty_fd);
+      process_output_consumer_track_fd(p->infd, p->pid, p->infd);
 
       pset_tty_name (p, build_string (pty_name));
     }
@@ -3842,8 +3840,6 @@ usage:  (make-serial-process &rest ARGS)  */)
     report_file_errno ("Opening serial port", port, EMFILE);
   p->infd = fd;
   p->outfd = fd;
-
-  process_output_consumer_track_fd(p->infd, p->pid, p->infd);
 
   if (fd > max_desc)
     max_desc = fd;
@@ -6360,11 +6356,6 @@ wait_reading_process_output (intmax_t time_limit, int nsecs, int read_kbd,
 	  FD_ZERO(&process_ready);
 	  int ready_count = process_output_buffers_ready_copy_fd_set(&process_ready);
 
-	  if (ready_count == 0)
-	    {
-	      process_output_producer_drain_notification_fd();
-	    }
-
 	  if (ready_count > nfds)
 	    {
 	      nfds = ready_count;
@@ -6810,12 +6801,14 @@ read_process_output (Lisp_Object proc, int channel)
       else
 #endif
         {
-	  if (p->is_server || PIPECONN1_P(p) || NETCONN1_P(p))
+	  if (SERIALCONN1_P(p) || PIPECONN1_P(p) || NETCONN1_P(p))
 	    {
 	      nbytes = emacs_read(channel, process_output_buffer + carryover, readmax);
-	    } else {
-	    nbytes = process_output_consumer_read(channel, p->pid, process_output_buffer + carryover, readmax);
-	  }
+	    }
+	  else
+	    {
+	      nbytes = process_output_consumer_read(channel, p->pid, process_output_buffer + carryover, readmax);
+	    }
 	}
 
       if (nbytes > 0 && p->adaptive_read_buffering)
