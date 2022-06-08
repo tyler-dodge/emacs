@@ -394,8 +394,8 @@ process_output_consumer_drain_ready_notification_fd(void)
       return 0;
     }
 
-  char throwaway[1];
-  int output = emacs_read(process_output_consumer_ready_read_fd, throwaway, 1);
+  char throwaway[128];
+  int output = emacs_read(process_output_consumer_ready_read_fd, throwaway, 128);
   if (output == -1)
     {
       if (!would_block(errno))
@@ -6332,37 +6332,33 @@ wait_reading_process_output (intmax_t time_limit, int nsecs, int read_kbd,
 	    timeout = make_timespec (0, 0);
 #endif
 	  int ready_fd = process_output_producer_ready_read_fd;
+	  int merged_max_desc = max_desc;
 	  if (ready_fd > 0)
 	    {
 	      FD_SET(ready_fd, &Available);
 	      if (ready_fd > max_desc)
 		{
-		  max_desc = ready_fd;
+		  merged_max_desc = ready_fd;
 		}
 	    }
 	  /* Non-macOS HAVE_GLIB builds call thread_select in xgselect.c.  */
 #if defined HAVE_GLIB && !defined HAVE_NS
-	  nfds = xg_select (max_desc + 1,
+	  nfds = xg_select (merged_max_desc + 1,
 			    &Available, (check_write ? &Writeok : 0),
 			    NULL, &timeout, NULL);
 #elif defined HAVE_NS
           /* And NS builds call thread_select in ns_select. */
-          nfds = ns_select (max_desc + 1,
+          nfds = ns_select (merged_max_desc + 1,
 			    &Available, (check_write ? &Writeok : 0),
 			    NULL, &timeout, NULL);
 #else  /* !HAVE_GLIB */
-	  nfds = thread_select (pselect, max_desc + 1,
+	  nfds = thread_select (pselect, merged_max_desc + 1,
 				&Available,
 				(check_write ? &Writeok : 0),
 				NULL, &timeout, NULL);
 #endif	/* !HAVE_GLIB */
 	  FD_ZERO(&process_ready);
 	  int ready_count = process_output_buffers_ready_copy_fd_set(&process_ready);
-	  int max_read_fd = process_output_buffers_ready_max_fd;
-	  if (max_desc < max_read_fd)
-	    {
-	      max_desc = max_read_fd;
-	    }
 
 	  if (ready_count == 0)
 	    {
