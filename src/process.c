@@ -289,6 +289,7 @@ struct process_output_buffer
   int buffer_size;
   int error;
   bool released;
+  bool ignored;
   char buffer[PROCESS_OUTPUT_MAX + 1];
   struct process_output_buffer * prev;
   struct process_output_buffer * next;
@@ -713,6 +714,7 @@ process_output_consumer_track_fd(int channel, int pid, int fd)
   buffer->channel = channel;
   buffer->completed = false;
   buffer->released = false;
+  buffer->ignored = false;
   buffer->prev = NULL;
 
   buffer->next = process_output_buffer_list;
@@ -788,7 +790,7 @@ process_output_producer_thread(void * args)
 		process_output_buffer_consumer_clear_ready_fd(buffer);
 		xfree((void *) buffer);
 	      }
-	    else
+	    else if (!buffer->ignored)
 	      {
 		has_output = true;
 
@@ -807,7 +809,7 @@ process_output_producer_thread(void * args)
 	FD_SET(fd, &fds);
 	const int outputSize = PROCESS_OUTPUT_MAX - buffer->buffer_size;
 	int updatedSize;
-	if (outputSize == 0)
+	if (outputSize == 0 || buffer->ignored)
 	  {
 	    buffer = buffer->next;
 	    continue;
@@ -902,10 +904,34 @@ process_output_consumer_deactivate_fd(int channel, int pid)
 {
   process_output_buffer_list_mutex_lock();
   struct process_output_buffer * buffer = process_output_buffer_get_active_by_channel_pid(channel, pid);
-  if (buffer != NULL && !buffer->released)
+  if (buffer != NULL)
     {
       buffer->released = true;
       process_output_buffer_consumer_clear_ready_fd(buffer);
+    }
+  process_output_buffer_list_mutex_unlock();
+}
+
+void
+process_output_consumer_ignore_fd(int channel, int pid)
+{
+  process_output_buffer_list_mutex_lock();
+  struct process_output_buffer * buffer = process_output_buffer_get_active_by_channel_pid(channel, pid);
+  if (buffer != NULL)
+    {
+      buffer->ignored = true;
+      process_output_buffer_consumer_clear_ready_fd(buffer);
+    }
+  process_output_buffer_list_mutex_unlock();
+}
+void
+process_output_consumer_unignore_fd(int channel, int pid)
+{
+  process_output_buffer_list_mutex_lock();
+  struct process_output_buffer * buffer = process_output_buffer_get_active_by_channel_pid(channel, pid);
+  if (buffer != NULL)
+    {
+      buffer->ignored = false;
     }
   process_output_buffer_list_mutex_unlock();
 }
@@ -2033,12 +2059,18 @@ The string argument is normally a multibyte string, except:
     {
       /* If filter WILL be t, stop reading output.  */
       if (EQ (filter, Qt) && !EQ (p->status, Qlisten))
-        delete_read_fd (p->infd);
+	{
+	  delete_read_fd (p->infd);
+	  process_output_consumer_ignore_fd(p->infd, p->pid);
+	}
       else if (/* If filter WAS t, then resume reading output.  */
                EQ (p->filter, Qt)
                /* Network or serial process not stopped:  */
                && !EQ (p->command, Qt))
-        add_process_read_fd (p->infd);
+	{
+	  add_process_read_fd (p->infd);
+	  process_output_consumer_unignore_fd(p->infd, p->pid);
+	}
     }
 
   pset_filter (p, filter);
@@ -2893,8 +2925,14 @@ create_process (Lisp_Object process, char **new_argv, Lisp_Object current_dir)
 
   p->pid = pid;
   if (pid >= 0)
-    p->alive = 1;
-  process_output_consumer_track_fd(p->infd, p->pid, p->infd);
+    {
+      p->alive = 1;
+      process_output_consumer_track_fd(p->infd, p->pid, p->infd);
+    }
+  if (EQ (p->filter, Qt))
+    {
+      process_output_consumer_ignore_fd(p->infd, p->pid);
+    }
 
   /* Stop blocking in the parent.  */
   unblock_child_signal (&oldset);
@@ -5392,6 +5430,7 @@ deactivate_process (Lisp_Object proc)
   int inchannel;
   struct Lisp_Process *p = XPROCESS (proc);
   int i;
+
 
 #ifdef HAVE_GNUTLS
   /* Delete GnuTLS structures in PROC, if any.  */
