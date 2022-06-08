@@ -367,7 +367,7 @@ process_output_consumer__locked_set_notification(bool new_value)
 
 /*
  * Called by the consumer to signal to the producer
- * that the consumer has consumed all of the output available.
+ * that the consumer has changed the process_output_buffers list
  */
 void
 process_output_consumer_write_ready_notification_fd(void)
@@ -436,7 +436,7 @@ process_output_producer__locked_set_notification(bool new_value)
 }
 
 /*
- * Called by both the producer and the consumer to signal
+ * Called by both the producer to signal
  * there is no more output available in any buffers.
  */
 int
@@ -787,7 +787,6 @@ process_output_producer_thread(void * args)
 		  {
 		    buffer->next->prev = buffer->prev;
 		  }
-		process_output_buffer_consumer_clear_ready_fd(buffer);
 		xfree((void *) buffer);
 	      }
 	    else if (!buffer->ignored)
@@ -3130,6 +3129,8 @@ usage:  (make-pipe-process &rest ARGS)  */)
 
   if (!EQ (p->command, Qt))
     add_process_read_fd (inchannel);
+  process_output_consumer_track_fd(p->infd, p->pid, p->infd);
+
   p->adaptive_read_buffering
     = (NILP (Vprocess_adaptive_read_buffering) ? 0
        : EQ (Vprocess_adaptive_read_buffering, Qt) ? 1 : 2);
@@ -6801,7 +6802,7 @@ read_process_output (Lisp_Object proc, int channel)
       else
 #endif
         {
-	  if (SERIALCONN1_P(p) || PIPECONN1_P(p) || NETCONN1_P(p))
+	  if (SERIALCONN1_P(p) || NETCONN1_P(p))
 	    {
 	      nbytes = emacs_read(channel, process_output_buffer + carryover, readmax);
 	    }
