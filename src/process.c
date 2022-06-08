@@ -3130,9 +3130,15 @@ usage:  (make-pipe-process &rest ARGS)  */)
     pset_command (p, Qt);
   eassert (! p->pty_flag);
 
+  process_output_consumer_track_fd(p->infd, p->pid, p->infd);
+
   if (!EQ (p->command, Qt))
     add_process_read_fd (inchannel);
-  process_output_consumer_track_fd(p->infd, p->pid, p->infd);
+  else
+    {
+      process_output_consumer_ignore_fd(p->infd, p->pid);
+    }
+
 
   p->adaptive_read_buffering
     = (NILP (Vprocess_adaptive_read_buffering) ? 0
@@ -7706,15 +7712,20 @@ If PROCESS is a network or serial or pipe connection, inhibit handling
 of incoming traffic.  */)
   (Lisp_Object process, Lisp_Object current_group)
 {
-  if (PROCESSP (process) && (NETCONN_P (process) || SERIALCONN_P (process)
+  struct Lisp_Process *p = NULL;
+  if (PROCESSP(process))
+    {
+      p = XPROCESS (process);
+    }
+
+  if (p != NULL && (NETCONN_P (process) || SERIALCONN_P (process)
 			     || PIPECONN_P (process)))
     {
-      struct Lisp_Process *p;
 
-      p = XPROCESS (process);
       if (NILP (p->command)
 	  && p->infd >= 0)
-	delete_read_fd (p->infd);
+	 delete_read_fd (p->infd);
+
       pset_command (p, Qt);
       return process;
     }
@@ -7723,6 +7734,11 @@ of incoming traffic.  */)
 #else
   process_send_signal (process, SIGTSTP, current_group, 0);
 #endif
+  if (p != NULL && p->infd >= 0)
+    {
+      process_output_consumer_ignore_fd(p->infd, p->pid);
+    }
+
   return process;
 }
 
@@ -7733,7 +7749,12 @@ If PROCESS is a network or serial process, resume handling of incoming
 traffic.  */)
   (Lisp_Object process, Lisp_Object current_group)
 {
-  if (PROCESSP (process) && (NETCONN_P (process) || SERIALCONN_P (process)
+  struct Lisp_Process *p = NULL;
+  if (PROCESSP(process))
+    {
+      p = XPROCESS (process);
+    }
+  if (p != NULL && (NETCONN_P (process) || SERIALCONN_P (process)
 			     || PIPECONN_P (process)))
     {
       struct Lisp_Process *p;
@@ -7752,6 +7773,12 @@ traffic.  */)
 	  tcflush (p->infd, TCIFLUSH);
 #endif /* not WINDOWSNT */
 	}
+
+      if (p->infd >= 0)
+	{
+	  process_output_consumer_unignore_fd(p->infd, p->pid);
+	}
+
       pset_command (p, Qnil);
       return process;
     }
@@ -7760,6 +7787,11 @@ traffic.  */)
 #else
     error ("No SIGCONT support");
 #endif
+
+    if (p != NULL && p->infd >= 0)
+      {
+	process_output_consumer_unignore_fd(p->infd, p->pid);
+      }
   return process;
 }
 
