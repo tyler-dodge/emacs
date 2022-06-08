@@ -863,15 +863,9 @@ process_output_producer_thread(void * args)
 	  {
 	    if (buffer->buffer_size > 0 || buffer->completed)
 	      {
-		if (buffer->completed)
-		  {
-		    has_output = true;
-		  }
 		readingCount++;
-		if (updatedSize > 0 || buffer->completed)
-		  {
-		    process_output_buffer_producer_set_ready_fd(buffer);
-		  }
+		has_output = true;
+		process_output_buffer_producer_set_ready_fd(buffer);
 	      }
 	  }
 
