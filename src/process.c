@@ -769,107 +769,110 @@ process_output_producer_thread(void * args)
       bool has_output = false;
       while (buffer != NULL)
 	{
-	if (buffer->completed)
-	  {
-	    struct process_output_buffer * next = buffer->next;
-	    if (buffer->released)
-	      {
-		FD_CLR(buffer->fd, &tracked_fds);
-		if (buffer == process_output_buffer_list)
-		  {
-		    process_output_buffer_list = buffer->next;
-		  }
-		if (buffer->prev != NULL)
-		  {
-		    buffer->prev->next = buffer->next;
-		  }
-		if (buffer->next != NULL)
-		  {
-		    buffer->next->prev = buffer->prev;
-		  }
-		xfree((void *) buffer);
-	      }
-	    else if (!buffer->ignored)
-	      {
-		has_output = true;
+	  if (buffer->completed || buffer->released)
+	    {
+	      struct process_output_buffer * next = buffer->next;
+	      if (buffer->released)
+		{
+		  FD_CLR(buffer->fd, &tracked_fds);
+		  if (buffer == process_output_buffer_list)
+		    {
+		      process_output_buffer_list = buffer->next;
+		    }
+		  if (buffer->prev != NULL)
+		    {
+		      buffer->prev->next = buffer->next;
+		    }
+		  if (buffer->next != NULL)
+		    {
+		      buffer->next->prev = buffer->prev;
+		    }
+		  xfree((void *) buffer);
+		}
+	      else if (!buffer->ignored)
+		{
+		  has_output = true;
 
-		process_output_buffer_producer_set_ready_fd(buffer);
-	      }
-	    buffer = next;
-	    continue;
-	  }
+		  process_output_buffer_producer_set_ready_fd(buffer);
+		}
+	      buffer = next;
+	      continue;
+	    }
 
 
-	const int fd = buffer->fd;
-	if (fd > maxFd)
-	  {
-	    maxFd = fd;
-	  }
-	FD_SET(fd, &fds);
-	const int outputSize = PROCESS_OUTPUT_MAX - buffer->buffer_size;
-	int updatedSize;
-	if (outputSize == 0 || buffer->ignored)
-	  {
-	    buffer = buffer->next;
-	    continue;
-	  }
-	if (FD_ISSET(fd, &ready_fds) || FD_ISSET(fd, &outputting_fds) || !FD_ISSET(fd, &tracked_fds))
-	  {
-	    process_output_buffer_list_mutex_unlock();
-	    FD_SET(fd, &tracked_fds);
-	    updatedSize = emacs_read(fd, process_output_producer_copy_buffer, outputSize);
-	    if (updatedSize > 0)
-	      {
-		FD_SET(fd, &outputting_fds);
-	      }
-	    else
-	      {
-		FD_CLR(fd, &outputting_fds);
-	      }
-	    process_output_buffer_list_mutex_lock();
-	  }
-	else
-	  {
-	    updatedSize = -1;
-	    errno = EAGAIN;
-	  }
+	  const int fd = buffer->fd;
+	  if (fd > maxFd)
+	    {
+	      maxFd = fd;
+	    }
 
-	if (updatedSize > 0)
-	  {
-	    // buffer_size should only decrease between locks so this'll be fine.
-	    memcpy(buffer->buffer + buffer->buffer_size, process_output_producer_copy_buffer, updatedSize);
-	  }
+	  const int outputSize = PROCESS_OUTPUT_MAX - buffer->buffer_size;
+	  int updatedSize;
+	  if (outputSize == 0 || buffer->ignored)
+	    {
+	      buffer = buffer->next;
+	      continue;
+	    }
 
-	if (errno != 0)
-	  {
-	    buffer->error = errno;
-	  }
-	else
-	  {
-	    buffer->error = 0;
-	  }
-	if (updatedSize > 0)
-	  {
-	    buffer->buffer_size += updatedSize;
-	  }
+	  FD_SET(fd, &fds);
 
-	if (updatedSize == 0 || (updatedSize == -1 && !would_block(buffer->error)))
-	  {
-	    buffer->completed = true;
-	  }
+	  if (FD_ISSET(fd, &ready_fds) || FD_ISSET(fd, &outputting_fds) || !FD_ISSET(fd, &tracked_fds))
+	    {
+	      process_output_buffer_list_mutex_unlock();
+	      FD_SET(fd, &tracked_fds);
+	      updatedSize = emacs_read(fd, process_output_producer_copy_buffer, outputSize);
+	      if (updatedSize > 0)
+		{
+		  FD_SET(fd, &outputting_fds);
+		}
+	      else
+		{
+		  FD_CLR(fd, &outputting_fds);
+		}
+	      process_output_buffer_list_mutex_lock();
+	    }
+	  else
+	    {
+	      updatedSize = -1;
+	      errno = EAGAIN;
+	    }
 
-	if (!buffer->released)
-	  {
-	    if (buffer->buffer_size > 0 || buffer->completed)
-	      {
-		readingCount++;
-		has_output = true;
-		process_output_buffer_producer_set_ready_fd(buffer);
-	      }
-	  }
+	  if (updatedSize > 0)
+	    {
+	      // buffer_size should only decrease between locks so this'll be fine.
+	      memcpy(buffer->buffer + buffer->buffer_size, process_output_producer_copy_buffer, updatedSize);
+	    }
 
-	buffer = buffer->next;
-      }
+	  if (errno != 0)
+	    {
+	      buffer->error = errno;
+	    }
+	  else
+	    {
+	      buffer->error = 0;
+	    }
+	  if (updatedSize > 0)
+	    {
+	      buffer->buffer_size += updatedSize;
+	    }
+
+	  if (updatedSize == 0 || (updatedSize == -1 && !would_block(buffer->error)))
+	    {
+	      buffer->completed = true;
+	    }
+
+	  if (!buffer->released)
+	    {
+	      if (buffer->buffer_size > 0 || buffer->completed)
+		{
+		  readingCount++;
+		  has_output = true;
+		  process_output_buffer_producer_set_ready_fd(buffer);
+		}
+	    }
+
+	  buffer = buffer->next;
+	}
       if (has_output)
 	{
 	  process_output_producer_write_notification_fd();
