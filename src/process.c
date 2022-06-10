@@ -489,6 +489,8 @@ static int process_output_buffers_ready_count = 0;
 /* The fd set that represents the process output buffers that have output available */
 static fd_set process_output_buffers_ready_fds;
 
+/* The fd set used by the consumer thread to check if it the fd is being processed by the producer thread */
+static fd_set process_output_consumer_tracked_fds;
 
 /*
  * Lookup active process output buffer by channel pid tuple.
@@ -648,6 +650,7 @@ process_output_consumer_read(int channel, int pid, void * buf, ptrdiff_t nbyte)
       if (completed)
 	{
 	  buffer->released = true;
+	  FD_CLR(fd, &process_output_consumer_tracked_fds);
 	  process_output_consumer_write_ready_notification_fd();
 	  process_output_buffer_consumer_clear_ready_fd(buffer);
 	}
@@ -727,6 +730,7 @@ process_output_consumer_track_fd(int channel, int pid, int fd)
   process_output_buffer_list = buffer;
   process_output_consumer_write_ready_notification_fd();
   process_output_buffer_list_mutex_unlock();
+  FD_SET(channel, &process_output_consumer_tracked_fds);
 }
 
 /*
@@ -903,14 +907,28 @@ process_output_consumer_deactivate_fd(int channel, int pid)
   if (buffer != NULL)
     {
       buffer->released = true;
+      FD_CLR(channel, &process_output_consumer_tracked_fds);
       process_output_buffer_consumer_clear_ready_fd(buffer);
     }
   process_output_buffer_list_mutex_unlock();
 }
 
+/*
+ * Should only be called from the main thread.
+ */
+bool
+process_output_consumer_fd_tracked_p(int channel)
+{
+  return channel >= 0 && FD_ISSET(channel, &process_output_consumer_tracked_fds);
+}
+
 void
 process_output_consumer_ignore_fd(int channel, int pid)
 {
+  if (!process_output_consumer_fd_tracked_p(channel))
+    {
+      return;
+    }
   process_output_buffer_list_mutex_lock();
   struct process_output_buffer * buffer = process_output_buffer_get_active_by_channel_pid(channel, pid);
   if (buffer != NULL)
@@ -923,6 +941,10 @@ process_output_consumer_ignore_fd(int channel, int pid)
 void
 process_output_consumer_unignore_fd(int channel, int pid)
 {
+  if (!process_output_consumer_fd_tracked_p(channel))
+    {
+      return;
+    }
   process_output_buffer_list_mutex_lock();
   struct process_output_buffer * buffer = process_output_buffer_get_active_by_channel_pid(channel, pid);
   if (buffer != NULL)
@@ -2023,10 +2045,7 @@ set_process_filter_masks (struct Lisp_Process *p)
     && !EQ (p->command, Qt))
     {
       add_process_read_fd (p->infd);
-      if (!p->is_non_blocking_client && !p->is_server)
-	{
-	  process_output_consumer_unignore_fd(p->infd, p->pid);
-	}
+      process_output_consumer_unignore_fd(p->infd, p->pid);
     }
 }
 
@@ -2073,11 +2092,7 @@ The string argument is normally a multibyte string, except:
 	       && !EQ (p->command, Qt))
 	{
 	  add_process_read_fd (p->infd);
-	  if (!p->is_non_blocking_client && !p->is_server)
-	    {
-	      process_output_consumer_unignore_fd(p->infd, p->pid);
-	    }
-
+	  process_output_consumer_unignore_fd(p->infd, p->pid);
 	}
     }
 
@@ -4405,7 +4420,7 @@ connect_network_socket (Lisp_Object proc, Lisp_Object addrinfos,
 	 still listen for incoming connects unless it is stopped.  */
       if (!p->is_server && !p->is_non_blocking_client && NILP(p->gnutls_boot_parameters) && !p->gnutls_p)
 	{
-	  process_output_consumer_track_fd(p->infd, p->pid, p->infd);
+	  //process_output_consumer_track_fd(p->infd, p->pid, p->infd);
 	}
       if ((!EQ (p->filter, Qt) && !EQ (p->command, Qt))
 	|| (EQ (p->status, Qlisten) && NILP (p->command)))
@@ -5765,7 +5780,7 @@ server_accept_connection (Lisp_Object server, int channel)
 
   if (NILP (p->gnutls_boot_parameters) && !p->gnutls_p)
     {
-      process_output_consumer_track_fd(p->infd, p->pid, p->infd);
+      //process_output_consumer_track_fd(p->infd, p->pid, p->infd);
     }
 
   /* Client processes for accepted connections are not stopped initially.  */
@@ -6872,13 +6887,13 @@ read_process_output (Lisp_Object proc, int channel)
       else
 #endif
         {
-	  if (p->is_server || p->is_non_blocking_client || !NILP(p->gnutls_boot_parameters) || p->gnutls_p)
+	  if (process_output_consumer_fd_tracked_p(channel))
 	    {
-	      nbytes = emacs_read(channel, process_output_buffer + carryover, readmax);
+	      nbytes = process_output_consumer_read(channel, p->pid, process_output_buffer + carryover, readmax);
 	    }
 	  else
 	    {
-	      nbytes = process_output_consumer_read(channel, p->pid, process_output_buffer + carryover, readmax);
+	      nbytes = emacs_read(channel, process_output_buffer + carryover, readmax);
 	    }
 	}
 
@@ -7835,10 +7850,7 @@ traffic.  */)
 #endif /* not WINDOWSNT */
 	}
 
-      if (p->infd >= 0 && !p->is_non_blocking_client && !p->is_server)
-	{
-	  process_output_consumer_unignore_fd(p->infd, p->pid);
-	}
+      process_output_consumer_unignore_fd(p->infd, p->pid);
 
       pset_command (p, Qnil);
       return process;
@@ -7849,7 +7861,7 @@ traffic.  */)
     error ("No SIGCONT support");
 #endif
 
-    if (p != NULL && p->infd >= 0 && !p->is_non_blocking_client && !p->is_server)
+    if (p != NULL)
       {
 	process_output_consumer_unignore_fd(p->infd, p->pid);
       }
