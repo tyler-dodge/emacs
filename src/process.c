@@ -6865,7 +6865,7 @@ read_process_output (Lisp_Object proc, int channel)
       else
 #endif
         {
-	  if (process_output_consumer_fd_tracked_p(channel))
+	  if (process_output_consumer_fd_tracked_p(channel) && !NETCONN1_P(p))
 	    {
 	      nbytes = process_output_consumer_read(channel, p->pid, process_output_buffer + carryover, readmax);
 	    }
