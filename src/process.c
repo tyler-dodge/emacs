@@ -694,7 +694,7 @@ process_output_consumer_read(int channel, int pid, void * buf, ptrdiff_t nbyte)
  * know about any new fds that need to be consumed.
  */
 void
-process_output_consumer_track_fd(int channel, int pid, int fd)
+process_output_consumer_track_fd(int channel, int pid, int fd, bool start_ignored)
 {
   if (fd < 0)
     {
@@ -717,7 +717,7 @@ process_output_consumer_track_fd(int channel, int pid, int fd)
   buffer->channel = channel;
   buffer->completed = false;
   buffer->released = false;
-  buffer->ignored = false;
+  buffer->ignored = start_ignored;
   buffer->prev = NULL;
 
   buffer->next = process_output_buffer_list;
@@ -2992,11 +2992,7 @@ create_process (Lisp_Object process, char **new_argv, Lisp_Object current_dir)
 	  struct Lisp_Process *pp = XPROCESS (p->stderrproc);
 	  close_process_fd (&pp->open_fd[SUBPROCESS_STDOUT]);
 	}
-      process_output_consumer_track_fd(p->infd, p->pid, p->infd);
-      if (EQ (p->command, Qt) || EQ (p->filter, Qt))
-	{
-	  process_output_consumer_ignore_fd(p->infd, p->pid);
-	}
+      process_output_consumer_track_fd(p->infd, p->pid, p->infd, EQ (p->command, Qt) || EQ (p->filter, Qt));
     }
 }
 
@@ -3050,7 +3046,7 @@ create_pty (Lisp_Object process)
       setup_process_coding_systems (process);
 
       add_process_read_fd (pty_fd);
-      process_output_consumer_track_fd(p->infd, p->pid, p->infd);
+      process_output_consumer_track_fd(p->infd, p->pid, p->infd, false);
 
       pset_tty_name (p, build_string (pty_name));
     }
@@ -3157,14 +3153,10 @@ usage:  (make-pipe-process &rest ARGS)  */)
     pset_command (p, Qt);
   eassert (! p->pty_flag);
 
-  process_output_consumer_track_fd(p->infd, p->pid, p->infd);
+  process_output_consumer_track_fd(p->infd, p->pid, p->infd, EQ (p->command, Qt));
 
   if (!EQ (p->command, Qt))
     add_process_read_fd (inchannel);
-  else
-    {
-      process_output_consumer_ignore_fd(p->infd, p->pid);
-    }
 
 
   p->adaptive_read_buffering
@@ -3900,15 +3892,11 @@ usage:  (make-serial-process &rest ARGS)  */)
   if (tem = Fplist_get (contact, QCstop), !NILP (tem))
     pset_command (p, Qt);
   eassert (! p->pty_flag);
-  process_output_consumer_track_fd(p->infd, p->pid, p->infd);
+  process_output_consumer_track_fd(p->infd, p->pid, p->infd, EQ (p->command, Qt) || EQ (p->filter, Qt));
   if (!EQ (p->command, Qt)
     && !EQ (p->filter, Qt))
     {
       add_process_read_fd (fd);
-    }
-  else
-    {
-      process_output_consumer_ignore_fd(p->infd, p->pid);
     }
 
   update_process_mark (p);
@@ -4418,10 +4406,6 @@ connect_network_socket (Lisp_Object proc, Lisp_Object addrinfos,
     {
       /* A server may have a client filter setting of Qt, but it must
 	 still listen for incoming connects unless it is stopped.  */
-      if (!p->is_server && !p->is_non_blocking_client && NILP(p->gnutls_boot_parameters) && !p->gnutls_p)
-	{
-	  //process_output_consumer_track_fd(p->infd, p->pid, p->infd);
-	}
       if ((!EQ (p->filter, Qt) && !EQ (p->command, Qt))
 	|| (EQ (p->status, Qlisten) && NILP (p->command)))
 	{
@@ -4429,7 +4413,6 @@ connect_network_socket (Lisp_Object proc, Lisp_Object addrinfos,
 	}
       else
 	{
-	  process_output_consumer_ignore_fd(p->infd, p->pid);
 	}
     }
 
@@ -5777,11 +5760,6 @@ server_accept_connection (Lisp_Object server, int channel)
   p->infd  = s;
   p->outfd = s;
   pset_status (p, Qrun);
-
-  if (NILP (p->gnutls_boot_parameters) && !p->gnutls_p)
-    {
-      //process_output_consumer_track_fd(p->infd, p->pid, p->infd);
-    }
 
   /* Client processes for accepted connections are not stopped initially.  */
   if (!EQ (p->filter, Qt))
