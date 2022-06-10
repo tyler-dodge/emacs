@@ -1357,7 +1357,6 @@ compute_non_keyboard_wait_mask (fd_set *mask)
 	  && fd_callback_info[fd].waiting_thread != current_thread)
 	continue;
       if ((fd_callback_info[fd].flags & FOR_READ) != 0
-	&& (fd_callback_info[fd].flags & PROCESS_FD) == 0
 	  && (fd_callback_info[fd].flags & KEYBOARD_FD) == 0)
 	{
 	  FD_SET (fd, mask);
@@ -2015,11 +2014,20 @@ static void
 set_process_filter_masks (struct Lisp_Process *p)
 {
   if (EQ (p->filter, Qt) && !EQ (p->status, Qlisten))
-    delete_read_fd (p->infd);
+    {
+      delete_read_fd (p->infd);
+      process_output_consumer_ignore_fd(p->infd, p->pid);
+    }
   else if (EQ (p->filter, Qt)
-	   /* Network or serial process not stopped:  */
-	   && !EQ (p->command, Qt))
-    add_process_read_fd (p->infd);
+    /* Network or serial process not stopped:  */
+    && !EQ (p->command, Qt))
+    {
+      add_process_read_fd (p->infd);
+      if (!p->is_non_blocking_client && !p->is_server)
+	{
+	  process_output_consumer_unignore_fd(p->infd, p->pid);
+	}
+    }
 }
 
 DEFUN ("set-process-filter", Fset_process_filter, Sset_process_filter,
@@ -2060,12 +2068,16 @@ The string argument is normally a multibyte string, except:
 	  process_output_consumer_ignore_fd(p->infd, p->pid);
 	}
       else if (/* If filter WAS t, then resume reading output.  */
-               EQ (p->filter, Qt)
-               /* Network or serial process not stopped:  */
-               && !EQ (p->command, Qt))
+	       EQ (p->filter, Qt)
+	       /* Network or serial process not stopped:  */
+	       && !EQ (p->command, Qt))
 	{
 	  add_process_read_fd (p->infd);
-	  process_output_consumer_unignore_fd(p->infd, p->pid);
+	  if (!p->is_non_blocking_client && !p->is_server)
+	    {
+	      process_output_consumer_unignore_fd(p->infd, p->pid);
+	    }
+
 	}
     }
 
@@ -2966,7 +2978,7 @@ create_process (Lisp_Object process, char **new_argv, Lisp_Object current_dir)
 	  close_process_fd (&pp->open_fd[SUBPROCESS_STDOUT]);
 	}
       process_output_consumer_track_fd(p->infd, p->pid, p->infd);
-      if (EQ (p->filter, Qt))
+      if (EQ (p->command, Qt) || EQ (p->filter, Qt))
 	{
 	  process_output_consumer_ignore_fd(p->infd, p->pid);
 	}
@@ -3873,11 +3885,15 @@ usage:  (make-serial-process &rest ARGS)  */)
   if (tem = Fplist_get (contact, QCstop), !NILP (tem))
     pset_command (p, Qt);
   eassert (! p->pty_flag);
-
+  process_output_consumer_track_fd(p->infd, p->pid, p->infd);
   if (!EQ (p->command, Qt)
     && !EQ (p->filter, Qt))
     {
       add_process_read_fd (fd);
+    }
+  else
+    {
+      process_output_consumer_ignore_fd(p->infd, p->pid);
     }
 
   update_process_mark (p);
@@ -4023,15 +4039,15 @@ finish_after_tls_connection (Lisp_Object proc)
 
   if (!NILP (Ffboundp (Qnsm_verify_connection)))
     result = call3 (Qnsm_verify_connection,
-		    proc,
-		    Fplist_get (contact, QChost),
-		    Fplist_get (contact, QCservice));
+      proc,
+      Fplist_get (contact, QChost),
+      Fplist_get (contact, QCservice));
 
   eassert (p->outfd < FD_SETSIZE);
   if (NILP (result))
     {
       pset_status (p, list2 (Qfailed,
-			     build_string ("The Network Security Manager stopped the connections")));
+	  build_string ("The Network Security Manager stopped the connections")));
       deactivate_process (proc);
     }
   else if (p->outfd < 0)
@@ -4377,18 +4393,31 @@ connect_network_socket (Lisp_Object proc, Lisp_Object addrinfos,
 	 in that case, we still need to signal this like a non-blocking
 	 connection.  */
       if (! (connecting_status (p->status)
-	     && EQ (XCDR (p->status), addrinfos)))
+	  && EQ (XCDR (p->status), addrinfos)))
 	pset_status (p, Fcons (Qconnect, addrinfos));
       eassert (0 <= inch && inch < FD_SETSIZE);
       if ((fd_callback_info[inch].flags & NON_BLOCKING_CONNECT_FD) == 0)
 	add_non_blocking_write_fd (inch);
     }
   else
-    /* A server may have a client filter setting of Qt, but it must
-       still listen for incoming connects unless it is stopped.  */
-    if ((!EQ (p->filter, Qt) && !EQ (p->command, Qt))
+    {
+      /* A server may have a client filter setting of Qt, but it must
+	 still listen for incoming connects unless it is stopped.  */
+      if (!p->is_server && !p->is_non_blocking_client && NILP(p->gnutls_boot_parameters) && !p->gnutls_p)
+	{
+	  process_output_consumer_track_fd(p->infd, p->pid, p->infd);
+	}
+      if ((!EQ (p->filter, Qt) && !EQ (p->command, Qt))
 	|| (EQ (p->status, Qlisten) && NILP (p->command)))
-      add_process_read_fd (inch);
+	{
+	  add_process_read_fd (inch);
+	}
+      else
+	{
+	  process_output_consumer_ignore_fd(p->infd, p->pid);
+	}
+    }
+
 
   if (inch > max_desc)
     max_desc = inch;
@@ -4874,7 +4903,7 @@ usage: (make-network-process &rest ARGS)  */)
 	    {
 	      struct servent *svc_info
 		= getservbyname (SSDATA (service),
-				 socktype == SOCK_DGRAM ? "udp" : "tcp");
+		  socktype == SOCK_DGRAM ? "udp" : "tcp");
 	      if (svc_info)
 		port = ntohs (svc_info->s_port);
 	    }
@@ -5734,9 +5763,21 @@ server_accept_connection (Lisp_Object server, int channel)
   p->outfd = s;
   pset_status (p, Qrun);
 
+  if (NILP (p->gnutls_boot_parameters) && !p->gnutls_p)
+    {
+      process_output_consumer_track_fd(p->infd, p->pid, p->infd);
+    }
+
   /* Client processes for accepted connections are not stopped initially.  */
   if (!EQ (p->filter, Qt))
-    add_process_read_fd (s);
+    {
+      add_process_read_fd (s);
+    }
+  else
+    {
+      process_output_consumer_ignore_fd(p->infd, p->pid);
+    }
+
   if (s > max_desc)
     max_desc = s;
 
@@ -6099,8 +6140,10 @@ wait_reading_process_output (intmax_t time_limit, int nsecs, int read_kbd,
 	{
 	  fd_set Atemp;
 	  fd_set Ctemp;
+	  int merged_max_desc = max_desc;
 
-          if (kbd_on_hold_p ())
+
+	  if (kbd_on_hold_p ())
             FD_ZERO (&Atemp);
           else
             compute_input_wait_mask (&Atemp);
@@ -6116,7 +6159,9 @@ wait_reading_process_output (intmax_t time_limit, int nsecs, int read_kbd,
 	    FD_CLR (fd, &Atemp);
 
 	  timeout = make_timespec (0, 0);
-	  if ((thread_select (pselect, max_desc + 1,
+	  fd_set process_ready;
+
+	  if ((thread_select (pselect, merged_max_desc + 1,
 			      &Atemp,
 			      (num_pending_connects > 0 ? &Ctemp : NULL),
 			      NULL, &timeout, NULL)
@@ -6193,9 +6238,13 @@ wait_reading_process_output (intmax_t time_limit, int nsecs, int read_kbd,
       else
 	{
 	  if (! read_kbd)
-	    compute_non_keyboard_wait_mask (&Available);
+	    {
+	      compute_non_keyboard_wait_mask (&Available);
+	    }
 	  else
-	    compute_input_wait_mask (&Available);
+	    {
+	      compute_input_wait_mask (&Available);
+	    }
 	  compute_write_mask (&Writeok);
  	  check_delay = wait_proc ? 0 : process_output_delay_count;
 	  check_write = true;
@@ -6339,6 +6388,9 @@ wait_reading_process_output (intmax_t time_limit, int nsecs, int read_kbd,
 #endif
 	  int ready_fd = process_output_producer_ready_read_fd;
 	  int merged_max_desc = max_desc;
+	  // Reseting available here because we don't want to react to fds being read by background reader
+	  // However, we still want it for filtering tls_fds before.
+
 	  if (ready_fd > 0)
 	    {
 	      FD_SET(ready_fd, &Available);
@@ -6370,6 +6422,9 @@ wait_reading_process_output (intmax_t time_limit, int nsecs, int read_kbd,
 	    {
 	      nfds = ready_count;
 	    }
+	  for (channel = 0; channel < FD_SETSIZE; ++channel)
+	    if (FD_ISSET(channel, &process_ready))
+	      FD_SET(channel, &Available);
 
 #ifdef HAVE_GNUTLS
 	  /* Merge tls_available into Available. */
@@ -6512,7 +6567,7 @@ wait_reading_process_output (intmax_t time_limit, int nsecs, int read_kbd,
           struct fd_callback_data *d = &fd_callback_info[channel];
           if (d->func
 	      && ((d->flags & FOR_READ
-		  && (FD_ISSET(channel, &process_ready) || FD_ISSET (channel, &Available)))
+		  && (FD_ISSET (channel, &Available)))
 		  || ((d->flags & FOR_WRITE)
 		      && FD_ISSET (channel, &Writeok))))
             d->func (channel, d->data);
@@ -6533,7 +6588,7 @@ wait_reading_process_output (intmax_t time_limit, int nsecs, int read_kbd,
 	      continue;
 	    }
 
-	  if ((FD_ISSET(channel, &process_ready) || FD_ISSET (channel, &Available))
+	  if ((FD_ISSET (channel, &Available))
 	      && ((fd_callback_info[channel].flags & (KEYBOARD_FD | PROCESS_FD))
 		  == PROCESS_FD))
 	    {
@@ -6592,6 +6647,7 @@ wait_reading_process_output (intmax_t time_limit, int nsecs, int read_kbd,
 		  /* Clear the descriptor now, so we only raise the
 		     signal once.  */
 		  delete_read_fd (channel);
+		  process_output_consumer_ignore_fd(channel, p->pid);
 
 		  if (p->pid == -2)
 		    {
@@ -6703,7 +6759,10 @@ wait_reading_process_output (intmax_t time_limit, int nsecs, int read_kbd,
 
 		  if (0 <= p->infd && !EQ (p->filter, Qt)
 		      && !EQ (p->command, Qt))
-		    add_process_read_fd (p->infd);
+		    {
+		      add_process_read_fd (p->infd);
+		      process_output_consumer_unignore_fd(p->infd, p->pid);
+		    }
 		}
 	    }
 	}			/* End for each file descriptor.  */
@@ -6756,7 +6815,6 @@ read_and_dispose_of_process_output (struct Lisp_Process *p, char *chars,
 				    ssize_t nbytes,
 				    struct coding_system *coding);
 
-char process_output_buffer[PROCESS_OUTPUT_MAX];
 
 /* Read pending output from the process channel,
    starting with our buffered-ahead character if we have one.
@@ -6781,14 +6839,14 @@ read_process_output (Lisp_Object proc, int channel)
   ptrdiff_t readmax = clip_to_bounds (1, read_process_output_max, PTRDIFF_MAX);
   ptrdiff_t count = SPECPDL_INDEX ();
   Lisp_Object odeactivate;
-  char *chars;
+  char *process_output_buffer;
 
   USE_SAFE_ALLOCA;
-  chars = SAFE_ALLOCA (sizeof coding->carryover + readmax);
+  process_output_buffer = SAFE_ALLOCA (sizeof coding->carryover + readmax);
 
   if (carryover)
     /* See the comment above.  */
-    memcpy (chars, SDATA (p->decoding_buf), carryover);
+    memcpy (process_output_buffer, SDATA (p->decoding_buf), carryover);
 
 #ifdef DATAGRAM_SOCKETS
   /* We have a working select, so proc_buffered_char is always -1.  */
@@ -6796,22 +6854,25 @@ read_process_output (Lisp_Object proc, int channel)
     {
       socklen_t len = datagram_address[channel].len;
       do
-	nbytes = recvfrom (channel, chars + carryover, readmax,
-			   0, datagram_address[channel].sa, &len);
+	{
+	  nbytes = recvfrom (channel, process_output_buffer + carryover, readmax,
+	    0, datagram_address[channel].sa, &len);
+	}
       while (nbytes < 0 && errno == EINTR);
     }
   else
 #endif
-
     {
 #ifdef HAVE_GNUTLS
       if (p->gnutls_p && p->gnutls_state)
-        nbytes = emacs_gnutls_read (p, process_output_buffer + carryover,
-            readmax);
+	{
+	  nbytes = emacs_gnutls_read (p, process_output_buffer + carryover,
+	    readmax);
+	}
       else
 #endif
         {
-	  if (SERIALCONN1_P(p) || NETCONN1_P(p))
+	  if (p->is_server || p->is_non_blocking_client || !NILP(p->gnutls_boot_parameters) || p->gnutls_p)
 	    {
 	      nbytes = emacs_read(channel, process_output_buffer + carryover, readmax);
 	    }
@@ -7734,7 +7795,7 @@ of incoming traffic.  */)
 #else
   process_send_signal (process, SIGTSTP, current_group, 0);
 #endif
-  if (p != NULL && p->infd >= 0)
+  if (p != NULL && p->infd >= 0 && !p->is_non_blocking_client && !p->is_server)
     {
       process_output_consumer_ignore_fd(p->infd, p->pid);
     }
@@ -7774,7 +7835,7 @@ traffic.  */)
 #endif /* not WINDOWSNT */
 	}
 
-      if (p->infd >= 0)
+      if (p->infd >= 0 && !p->is_non_blocking_client && !p->is_server)
 	{
 	  process_output_consumer_unignore_fd(p->infd, p->pid);
 	}
@@ -7788,7 +7849,7 @@ traffic.  */)
     error ("No SIGCONT support");
 #endif
 
-    if (p != NULL && p->infd >= 0)
+    if (p != NULL && p->infd >= 0 && !p->is_non_blocking_client && !p->is_server)
       {
 	process_output_consumer_unignore_fd(p->infd, p->pid);
       }
@@ -8172,7 +8233,10 @@ handle_child_signal (int sig)
 
 	      /* clear_desc_flag avoids a compiler bug in Microsoft C.  */
 	      if (clear_desc_flag)
-		delete_read_fd (p->infd);
+		{
+		  process_output_consumer_ignore_fd(p->infd, p->pid);
+		  delete_read_fd (p->infd);
+		}
 	    }
 	}
     }
