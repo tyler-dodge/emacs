@@ -307,6 +307,7 @@
 (require 'ehelp)
 (require 'ring)
 (require 'shell)
+(require 'tramp)
 
 (defgroup term nil
   "General command interpreter in a window."
