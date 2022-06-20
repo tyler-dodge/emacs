@@ -1717,13 +1717,16 @@ Nil if unknown.")
     (when (term--bash-needs-EMACSp)
       (push (format "EMACS=%s (term:%s)" emacs-version term-protocol-version)
             process-environment))
-    (apply #'start-process name buffer
-	   "/bin/sh" "-c"
-	   (format "stty -nl echo rows %d columns %d sane 2>%s;\
+    (let ((process
+           (apply #'start-file-process name buffer
+	          "/bin/sh" "-c"
+	          (format "stty -nl echo rows %d columns %d sane 2>%s;\
 if [ $1 = .. ]; then shift; fi; exec \"$@\""
-		   term-height term-width null-device)
-	   ".."
-	   command switches)))
+		          term-height term-width null-device)
+	          ".."
+	          command switches)))
+      (prog1 process
+        (set-process-coding-system process 'binary 'binary)))))
 
 
 ;;; Input history processing in a buffer
