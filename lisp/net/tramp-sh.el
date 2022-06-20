@@ -2891,7 +2891,7 @@ the result will be a local, non-Tramp, file name."
 
 (defun dece-tramp-filter (delegate)
   (lambda (proc string)
-    (ansi-color-for-comint-mode-filter proc string)))
+    (internal-default-process-filter proc (ansi-color-filter-apply string))))
 
 ;; We use BUFFER also as connection buffer during setup.  Because of
 ;; this, its original contents must be saved, and restored once
