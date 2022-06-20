@@ -1722,7 +1722,7 @@ Nil if unknown.")
 if [ $1 = .. ]; then shift; fi; exec \"$@\""
 		          term-height term-width null-device)
 	          ".."
-	          command switches)))
+	          (string-remove-prefix (tramp-handle-file-remote-p command) command) switches)))
       (prog1 process
         (set-process-coding-system process 'binary 'binary)))))
 
@@ -3674,7 +3674,7 @@ The top-most line is line 0."
 			   (substring string (1+ first-colon) second-colon))))
 	   (setq term-pending-frame (cons filename fileline))))
 	((= (aref string 0) ?/)
-	 (cd (substring string 1)))
+	 (cd (concat (tramp-handle-file-remote-p default-directory) (substring string 1))))
 	;; Allowing the inferior to call functions in Emacs is
 	;; probably too big a security hole.
 	;; ((= (aref string 0) ?!)
