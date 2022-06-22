@@ -5580,7 +5580,7 @@ See the subroutine `basic-save-buffer' for more information."
              (buffer-file-name)
              (not noninteractive)
              (not save-silently))
-	(message "Saving file %s..." (buffer-file-name)))
+	nil)
     (basic-save-buffer (called-interactively-p 'any))
     (and modp (memq arg '(4 64)) (setq buffer-backed-up nil))))
 
