@@ -796,6 +796,7 @@ process_output_producer_thread(void * args)
 	      else if (!buffer->ignored)
 		{
 		  has_output = true;
+		  process_output_producer_write_notification_fd();
 
 		  process_output_buffer_producer_set_ready_fd(buffer);
 		}
@@ -871,17 +872,14 @@ process_output_producer_thread(void * args)
 		{
 		  readingCount++;
 		  has_output = true;
+		  process_output_producer_write_notification_fd();
 		  process_output_buffer_producer_set_ready_fd(buffer);
 		}
 	    }
 
 	  buffer = buffer->next;
 	}
-      if (has_output)
-	{
-	  process_output_producer_write_notification_fd();
-	}
-      else
+      if (!has_output)
 	{
 	  process_output_producer_drain_notification_fd();
 	}
