@@ -1725,7 +1725,10 @@ Nil if unknown.")
 if [ $1 = .. ]; then shift; fi; exec \"$@\""
 		          term-height term-width null-device)
 	          ".."
-	          (string-remove-prefix (tramp-handle-file-remote-p command) command) switches)))
+                  (if-let ((prefix (tramp-handle-file-remote-p command)))
+                      (string-remove-prefix prefix command)
+                    command)
+	           switches)))
       (prog1 process
         (set-process-coding-system process 'binary 'binary)))))
 
