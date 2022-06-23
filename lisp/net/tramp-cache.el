@@ -395,7 +395,7 @@ the connection, return DEFAULT."
 	       (not (and (processp key) (not (process-live-p key)))))
       (setq value cached
 	    cache-used t))
-    (tramp-message key 7 "%s %s; cache used: %s" property value cache-used)
+    (tramp-message key 7 "%s %s; cache used: %s" property (lambda () value) cache-used)
     value))
 
 ;;;###tramp-autoload
@@ -412,7 +412,7 @@ Return VALUE."
     (puthash property value hash))
   (setq tramp-cache-data-changed
 	(or tramp-cache-data-changed (tramp-file-name-p key)))
-  (tramp-message key 7 "%s %s" property value)
+  (tramp-message key 7 "%s %s" property (lambda () value))
   value)
 
 ;;;###tramp-autoload
