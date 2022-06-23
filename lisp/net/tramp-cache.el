@@ -447,8 +447,9 @@ used to cache connection properties of the local machine."
   (setq key (tramp-file-name-unify key))
   (tramp-message
    key 7 "%s %s" key
-   (when-let ((hash (gethash key tramp-cache-data)))
-     (hash-table-keys hash)))
+   (lambda ()
+     (when-let ((hash (gethash key tramp-cache-data)))
+       (hash-table-keys hash))))
   (setq tramp-cache-data-changed
 	(or tramp-cache-data-changed (tramp-file-name-p key)))
   (remhash key tramp-cache-data))
