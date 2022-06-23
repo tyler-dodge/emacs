@@ -278,7 +278,7 @@ network_lookup_address_info_1 (Lisp_Object host, const char *service,
 /*
  * The max size in bytes for the output buffers used by the process output producer thread.
  */
-#define PROCESS_OUTPUT_MAX (1024 * 1024 * 20)
+#define PROCESS_OUTPUT_MAX (1024 * 1024)
 
 struct process_output_buffer
 {
@@ -608,14 +608,9 @@ process_output_consumer_wait_for_fd(int fd)
 {
   process_output_buffer_list_mutex_lock();
 
-  const bool already_waiting = process_output_consumer_waiting_fd > -1;
-
   process_output_consumer_waiting_fd = fd;
-  if (!already_waiting)
-    {
-      process_output_producer_drain_notification_fd();
-      process_output_consumer_write_ready_notification_fd();
-    }
+  process_output_producer_drain_notification_fd();
+  process_output_consumer_write_ready_notification_fd();
 
   process_output_buffer_list_mutex_unlock();
 }
@@ -903,8 +898,13 @@ process_output_producer_thread(void * args)
 	      if (buffer->buffer_size > 0 || buffer->completed)
 		{
 		  readingCount++;
-		  has_output = true;
-		  process_output_producer_write_notification_fd();
+		  const bool is_waiting = process_output_consumer_waiting_fd > 0;
+		  // This check must be done again since the waiting process could have changed in the meantime.
+		  if (!is_waiting || (is_waiting && buffer->fd == process_output_consumer_waiting_fd))
+		    {
+		      has_output = true;
+		      process_output_producer_write_notification_fd();
+		    }
 		  process_output_buffer_producer_set_ready_fd(buffer);
 		}
 	    }
@@ -6210,7 +6210,10 @@ wait_reading_process_output (intmax_t time_limit, int nsecs, int read_kbd,
 	  /* If there is unread keyboard input, also return.  */
 	  if (read_kbd != 0
 	      && requeued_events_pending_p ())
-	    break;
+              {
+                  printf("BREAKING\n");
+                  break;
+              }
 
           /* This is so a breakpoint can be put here.  */
           if (!timespec_valid_p (timer_delay))
@@ -6293,7 +6296,7 @@ wait_reading_process_output (intmax_t time_limit, int nsecs, int read_kbd,
 	    {
 	      unsigned int count = 0;
 	      XSETPROCESS (proc, wait_proc);
-
+	      process_output_consumer_wait_for_fd(wait_proc->infd);
 	      while (true)
 		{
 		  int nread = read_process_output (proc, wait_proc->infd);
@@ -6326,7 +6329,10 @@ wait_reading_process_output (intmax_t time_limit, int nsecs, int read_kbd,
 	{
 	  if (wait_proc->infd < 0)  /* Terminated.  */
 	    break;
-	  FD_SET (wait_proc->infd, &Available);
+          if (!process_output_consumer_fd_tracked_p(wait_proc->infd))
+              {
+                  FD_SET (wait_proc->infd, &Available);
+              }
 	  check_delay = 0;
           check_write = 0;
 	}
@@ -6910,8 +6916,10 @@ wait_reading_process_output (intmax_t time_limit, int nsecs, int read_kbd,
      This could potentially lead to an endless wait (dealt with earlier in the
      function) and/or a wrong return value (dealt with here).  */
   if (wait_proc && wait_proc->nbytes_read != prev_wait_proc_nbytes_read)
-    got_some_output = min (INT_MAX, (wait_proc->nbytes_read
-                                     - prev_wait_proc_nbytes_read));
+    {
+      got_some_output = min (INT_MAX, (wait_proc->nbytes_read
+	  - prev_wait_proc_nbytes_read));
+    }
 
   return got_some_output;
 }

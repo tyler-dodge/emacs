@@ -2166,44 +2166,45 @@ is greater than or equal 4.
 Calls functions `message' and `tramp-debug-message' with FMT-STRING as
 control string and the remaining ARGUMENTS to actually emit the message (if
 applicable)."
-  (ignore-errors
-    (when (<= level tramp-verbose)
-      ;; Display only when there is a minimum level, and the progress
-      ;; reporter doesn't suppress further messages.
-      (when (and (<= level 3) (null tramp-inhibit-progress-reporter))
-	(apply #'message
-	       (concat
-		(cond
-		 ((= level 0) "")
-		 ((= level 1) "")
-		 ((= level 2) "Warning: ")
-		 (t           "Tramp: "))
-		fmt-string)
-	       arguments))
-      ;; Log only when there is a minimum level.
-      (when (>= tramp-verbose 4)
-	(let ((tramp-verbose 0))
-	  ;; Append connection buffer for error messages, if exists.
-	  (when (= level 1)
-	    (ignore-errors
-	      (setq fmt-string (concat fmt-string "\n%s")
-		    arguments
-		    (append
-		     arguments
-		     `(,(tramp-get-buffer-string
-			 (if (processp vec-or-proc)
-			     (process-buffer vec-or-proc)
-			   (tramp-get-connection-buffer
-			    vec-or-proc 'dont-create))))))))
-	  ;; Translate proc to vec.
-	  (when (processp vec-or-proc)
-	    (setq vec-or-proc (process-get vec-or-proc 'vector))))
-	;; Do it.
-	(when (tramp-file-name-p vec-or-proc)
-	  (apply #'tramp-debug-message
-		 vec-or-proc
-		 (concat (format "(%d) # " level) fmt-string)
-		 arguments))))))
+  (let ((eval-args (cl-loop for arg in arguments collect (if (functionp arg) (funcall arg) arg))))
+    (ignore-errors
+      (when (<= level tramp-verbose)
+        ;; Display only when there is a minimum level, and the progress
+        ;; reporter doesn't suppress further messages.
+        (when (and (<= level 3) (null tramp-inhibit-progress-reporter))
+	  (apply #'message
+	         (concat
+		  (cond
+		   ((= level 0) "")
+		   ((= level 1) "")
+		   ((= level 2) "Warning: ")
+		   (t           "Tramp: "))
+		  fmt-string)
+	         (funcall eval-args)))
+        ;; Log only when there is a minimum level.
+        (when (>= tramp-verbose 4)
+	  (let ((tramp-verbose 0))
+	    ;; Append connection buffer for error messages, if exists.
+	    (when (= level 1)
+	      (ignore-errors
+	        (setq fmt-string (concat fmt-string "\n%s")
+		      arguments
+		      (append
+		       arguments
+		       `(,(tramp-get-buffer-string
+			   (if (processp vec-or-proc)
+			       (process-buffer vec-or-proc)
+			     (tramp-get-connection-buffer
+			      vec-or-proc 'dont-create))))))))
+	    ;; Translate proc to vec.
+	    (when (processp vec-or-proc)
+	      (setq vec-or-proc (process-get vec-or-proc 'vector))))
+	  ;; Do it.
+	  (when (tramp-file-name-p vec-or-proc)
+	    (apply #'tramp-debug-message
+		   vec-or-proc
+		   (concat (format "(%d) # " level) fmt-string)
+		   (funcall eval-args))))))))
 
 (defsubst tramp-backtrace (&optional vec-or-proc force)
   "Dump a backtrace into the debug buffer.
@@ -5315,7 +5316,7 @@ of."
 		      (pop-to-buffer (tramp-get-connection-buffer vec))
 		      (read-string (match-string 0)))))))
     (tramp-message
-     vec 6 "\n%s" (tramp-get-buffer-string (tramp-get-connection-buffer vec)))
+     vec 6 "\n%s" (lambda () (tramp-get-buffer-string (tramp-get-connection-buffer vec))))
     (tramp-message vec 3 "Sending login name `%s'" user)
     (tramp-send-string vec (concat user tramp-local-end-of-line)))
   t)
@@ -5366,7 +5367,7 @@ See also `tramp-action-yn'."
       (kill-process proc)
       (throw 'tramp-action 'permission-denied))
     (tramp-message
-     vec 6 "\n%s" (tramp-get-buffer-string (tramp-get-connection-buffer vec)))
+     vec 6 "\n%s" (lambda () (tramp-get-buffer-string (tramp-get-connection-buffer vec))))
     (tramp-send-string vec (concat "yes" tramp-local-end-of-line)))
   t)
 
@@ -5380,7 +5381,7 @@ See also `tramp-action-yesno'."
       (kill-process proc)
       (throw 'tramp-action 'permission-denied))
     (tramp-message
-     vec 6 "\n%s" (tramp-get-buffer-string (tramp-get-connection-buffer vec)))
+     vec 6 "\n%s" (lambda () (tramp-get-buffer-string (tramp-get-connection-buffer vec))))
     (tramp-send-string vec (concat "y" tramp-local-end-of-line)))
   t)
 
@@ -5389,14 +5390,14 @@ See also `tramp-action-yesno'."
 The terminal type can be configured with `tramp-terminal-type'."
   (tramp-message vec 5 "Setting `%s' as terminal type." tramp-terminal-type)
   (tramp-message
-   vec 6 "\n%s" (tramp-get-buffer-string (tramp-get-connection-buffer vec)))
+   vec 6 "\n%s" (lambda () (tramp-get-buffer-string (tramp-get-connection-buffer vec))))
   (tramp-send-string vec (concat tramp-terminal-type tramp-local-end-of-line))
   t)
 
 (defun tramp-action-confirm-message (_proc vec)
   "Return RET in order to confirm the message."
   (tramp-message
-   vec 6 "\n%s" (tramp-get-buffer-string (tramp-get-connection-buffer vec)))
+   vec 6 "\n%s" (lambda () (tramp-get-buffer-string (tramp-get-connection-buffer vec))))
   (tramp-send-string vec tramp-local-end-of-line)
   t)
 
@@ -5409,7 +5410,7 @@ Wait, until the connection buffer changes."
 	  set-message-function clear-message-function)
       ;; Silence byte compiler.
       (ignore set-message-function clear-message-function)
-      (tramp-message vec 6 "\n%s" (buffer-string))
+      (tramp-message vec 6 "\n%s"  #'buffer-string)
       (tramp-check-for-regexp proc tramp-process-action-regexp)
       (with-temp-message
 	  (replace-regexp-in-string (rx (any "\r\n")) "" (match-string 0))
@@ -5528,7 +5529,7 @@ performed successfully.  Any other value means an error."
 			 (tramp-process-one-action proc vec actions)))))
 	(with-current-buffer (tramp-get-connection-buffer vec)
 	  (widen)
-	  (tramp-message vec 6 "\n%s" (buffer-string)))
+	  (tramp-message vec 6 "\n%s" #'buffer-string))
 	(if (eq exit 'ok)
 	    (ignore-errors
 	      (when (functionp tramp-password-save-function)
@@ -5598,10 +5599,9 @@ If the user quits via `C-g', it is propagated up to `tramp-file-name-handler'."
 	;; JUST-THIS-ONE is set due to Bug#12145.  `with-local-quit'
 	;; returns t in order to report success.
 	(if (with-local-quit
-	      (setq result (accept-process-output proc timeout nil t)) t)
-	    (tramp-message
-	     proc 10 "%s %s %s %s\n%s"
-	     proc timeout (process-status proc) result (buffer-string))
+              (progn
+	        (setq result (accept-process-output proc timeout nil t))) t)
+	    (progn)
 	  ;; Propagate quit.
 	  (keyboard-quit)))
       result)))
@@ -5666,12 +5666,13 @@ nil."
   (let ((found (tramp-check-for-regexp proc regexp)))
     (cond (timeout
 	   (with-timeout (timeout)
-	     (while (not found)
-	       (tramp-accept-process-output proc)
-	       (unless (process-live-p proc)
-		 (tramp-error-with-buffer
-		  nil proc 'file-error "Process has died"))
-	       (setq found (tramp-check-for-regexp proc regexp)))))
+             (progn
+	       (while (not found)
+                 (tramp-accept-process-output proc 1)
+	         (unless (process-live-p proc)
+		   (tramp-error-with-buffer
+		    nil proc 'file-error "Process has died"))
+	         (setq found (tramp-check-for-regexp proc regexp))))))
 	  (t
 	   (while (not found)
 	     (tramp-accept-process-output proc)
@@ -5683,7 +5684,7 @@ nil."
     ;; timeout of sudo.  The process buffer does not exist any longer then.
     (ignore-errors
       (tramp-message
-       proc 6 "\n%s" (tramp-get-buffer-string (process-buffer proc))))
+       proc 6 "\n%s" (lambda () (tramp-get-buffer-string (process-buffer proc)))))
     (unless found
       (if timeout
 	  (tramp-error
@@ -6392,7 +6393,7 @@ are written with verbosity of 6."
           (if (zerop result)
               (tramp-message vec 6 "%d" result)
             (tramp-message
-	     vec 6 "%d\n%s" result (tramp-get-buffer-string buffer))))
+	     vec 6 "%d\n%s" result (lambda () (tramp-get-buffer-string buffer)))))
       (error
        (setq result 1)
        (tramp-message vec 6 "%d\n%s" result (error-message-string err))))
