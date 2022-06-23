@@ -4765,18 +4765,18 @@ Goes through the list `tramp-local-coding-commands' and
 	    ;; corresponding command has to work locally.
 	    (if (not (stringp loc-enc))
 		(tramp-message
-		 vec 5 "Checking local encoding function `%s'" loc-enc)
+		 vec 5 "Checking local encoding function `%s'" (lambda () loc-enc))
 	      (tramp-message
-	       vec 5 "Checking local encoding command `%s' for sanity" loc-enc)
+	       vec 5 "Checking local encoding command `%s' for sanity" (lambda () loc-enc))
 	      (unless (stringp (setq loc-enc (tramp-expand-script nil loc-enc)))
 		(throw 'wont-work-local nil))
 	      (unless (zerop (tramp-call-local-coding-command loc-enc nil nil))
 		(throw 'wont-work-local nil)))
 	    (if (not (stringp loc-dec))
 		(tramp-message
-		 vec 5 "Checking local decoding function `%s'" loc-dec)
+		 vec 5 "Checking local decoding function `%s'" (lambda () loc-dec))
 	      (tramp-message
-	       vec 5 "Checking local decoding command `%s' for sanity" loc-dec)
+	       vec 5 "Checking local decoding command `%s' for sanity" (lambda () loc-dec))
 	      (unless (stringp (setq loc-dec (tramp-expand-script nil loc-dec)))
 		(throw 'wont-work-local nil))
 	      (unless (zerop (tramp-call-local-coding-command loc-dec nil nil))
@@ -4793,11 +4793,8 @@ Goes through the list `tramp-local-coding-commands' and
 		  (when (stringp rem-test)
 		    (tramp-message
 		     vec 5 "Checking remote test command `%s'" rem-test)
-                    (tramp-queue-command-and-check
-                     vec rem-test
-                     (lambda (response)
-                       (unless response
-                         (throw 'wont-work-remote nil))) t))
+                    (unless (tramp-send-command-and-check vec rem-test t)
+                      (throw 'wont-work-remote nil)))
 		  ;; Check if remote encoding and decoding commands can be
 		  ;; called remotely with null input and output.  This makes
 		  ;; sure there are no syntax errors and the command is really
@@ -4818,14 +4815,12 @@ Goes through the list `tramp-local-coding-commands' and
 		  (tramp-message
 		   vec 5
 		   "Checking remote encoding command `%s' for sanity" rem-enc)
-                  (tramp-queue-command-and-check
-                   vec
-                   (format
-                    "%s <%s" rem-enc (tramp-get-remote-null-device vec))
-                   (lambda (response)
-                     (unless response
-                       (throw 'wont-work-remote nil)))
-                   t)
+                  (unless (tramp-send-command-and-check
+                           vec
+                           (format
+                            "%s <%s" rem-enc (tramp-get-remote-null-device vec))
+                           t)
+                    (throw 'wont-work-remote nil))
 
 		  (unless (stringp rem-dec)
 		    (let ((name (symbol-name rem-dec))
@@ -4839,15 +4834,11 @@ Goes through the list `tramp-local-coding-commands' and
 		  (tramp-message
 		   vec 5
 		   "Checking remote decoding command `%s' for sanity" rem-dec)
-                  (tramp-queue-command-and-check
-                   vec
-                   (format "echo %s | %s | %s" magic rem-enc rem-dec)
-                   (lambda (response)
-                     (unless response
-                       (throw 'wont-work-remote nil)))
-                   t)
-
-                  (tramp-queue-command-send vec)
+                  (unless (tramp-send-command-and-check
+                           vec
+                           (format "echo %s | %s | %s" magic rem-enc rem-dec)
+                           t)
+                    (throw 'wont-work-remote nil))
 
 		  (with-current-buffer (tramp-get-connection-buffer vec)
 		    (goto-char (point-min))
@@ -4862,13 +4853,13 @@ Goes through the list `tramp-local-coding-commands' and
       (when found
 	;; Set connection properties.  Since the commands are risky
 	;; (due to output direction), we cache them in the process cache.
-	(tramp-message vec 5 "Using local encoding `%s'" loc-enc)
+	(tramp-message vec 5 "Using local encoding `%s'" (lambda () loc-enc))
 	(tramp-set-connection-property p "local-encoding" loc-enc)
-	(tramp-message vec 5 "Using local decoding `%s'" loc-dec)
+	(tramp-message vec 5 "Using local decoding `%s'" (lambda () loc-dec))
 	(tramp-set-connection-property p "local-decoding" loc-dec)
-	(tramp-message vec 5 "Using remote encoding `%s'" rem-enc)
+	(tramp-message vec 5 "Using remote encoding `%s'" (lambda () rem-enc))
 	(tramp-set-connection-property p "remote-encoding" rem-enc)
-	(tramp-message vec 5 "Using remote decoding `%s'" rem-dec)
+	(tramp-message vec 5 "Using remote decoding `%s'" (lambda () rem-dec))
 	(tramp-set-connection-property p "remote-decoding" rem-dec)))))
 
 (defun tramp-call-local-coding-command (cmd input output)
