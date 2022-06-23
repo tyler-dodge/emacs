@@ -511,6 +511,8 @@ process_output_buffer_get_active_by_channel_pid(int channel, int pid)
   return NULL;
 }
 
+static int process_output_consumer_waiting_fd = -1;
+
 /*
  * Copies the fd_set of ready process_output_buffers for use in the main emacs event loop
  * to indicate which processes are available for consuming output.
@@ -520,7 +522,19 @@ static int
 process_output_buffers_ready_copy_fd_set(fd_set * destination)
 {
   process_output_ready_fds_mutex_lock();
-  memcpy(destination, &process_output_buffers_ready_fds, sizeof(fd_set));
+  /* Should be safe because `process_output_consumer_waiting_fd` is only modified on main thread */
+  if (process_output_consumer_waiting_fd > -1)
+    {
+      FD_ZERO(destination);
+      if (FD_ISSET(process_output_consumer_waiting_fd, &process_output_buffers_ready_fds))
+	{
+	  FD_SET(process_output_consumer_waiting_fd, destination);
+	}
+    }
+  else
+    {
+      memcpy(destination, &process_output_buffers_ready_fds, sizeof(fd_set));
+    }
   int count = process_output_buffers_ready_count;
   process_output_ready_fds_mutex_unlock();
   return count;
@@ -601,15 +615,12 @@ process_output_buffer_producer_set_ready_fd(struct process_output_buffer * buffe
   errno = xerrno;
 }
 
-static int process_output_consumer_waiting_fd = -1;
-
 static void
 process_output_consumer_wait_for_fd(int fd)
 {
   process_output_buffer_list_mutex_lock();
 
   process_output_consumer_waiting_fd = fd;
-  process_output_producer_drain_notification_fd();
   process_output_consumer_write_ready_notification_fd();
 
   process_output_buffer_list_mutex_unlock();
