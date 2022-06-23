@@ -4484,8 +4484,7 @@ Mainly sets the prompt and the echo correctly.  PROC is the shell
 process to set up.  VEC specifies the connection."
   (setq tramp-queued-command nil
         tramp-queued-callbacks nil)
-  (let ((case-fold-search t)
-        (parent-proc (tramp-get-process (tramp-file-name-unify vec))))
+  (let ((case-fold-search t))
     (tramp-open-shell vec (tramp-get-method-parameter vec 'tramp-remote-shell))
     (tramp-message vec 5 "Setting up remote shell environment")
 
@@ -4513,7 +4512,6 @@ process to set up.  VEC specifies the connection."
          ;; width magic interferes with them.
          (tramp-send-command vec "stty icanon erase ^H cols 32767" t))))
     (tramp-message vec 5 "Setting shell prompt")
-    (tramp-queue-command-send vec)
 
     ;; Check whether the output of "uname -sr" has been changed.  If
     ;; yes, this is a strong indication that we must expire all
@@ -4523,20 +4521,26 @@ process to set up.  VEC specifies the connection."
     (let* ((old-uname (tramp-get-connection-property vec "uname" nil))
 	   (uname
 	    ;; If we are in `make-process', we don't need to recompute.
-	    (if (and old-uname
-		     (tramp-get-connection-property vec "process-name" nil))
-	        old-uname
-	      (tramp-set-connection-property
-	       vec "uname"
-	       (tramp-send-command-and-read vec "echo \\\"`uname -sr`\\\"")))))
-      (when (and (stringp old-uname) (not (string-equal old-uname uname)))
-        (tramp-message
-         vec 3
-         "Connection reset, because remote host changed from `%s' to `%s'"
-         old-uname uname)
-        ;; We want to keep the password.
-        (tramp-cleanup-connection vec t t)
-        (throw 'uname-changed (tramp-maybe-open-connection vec)))
+            (progn
+	      (if (and old-uname
+		       (tramp-get-connection-property vec "process-name" nil))
+	          old-uname
+                (tramp-queue-command-and-read
+                 vec
+                 "echo \\\"`uname -sr`\\\""
+                 (lambda (uname)
+                   (tramp-set-connection-property
+                    vec "uname" uname)
+                   (when (and (stringp old-uname) (not (string-equal old-uname uname)))
+                     (tramp-message
+                      vec 3
+                      "Connection reset, because remote host changed from `%s' to `%s'"
+                      old-uname uname)
+                     ;; We want to keep the password.
+                     (tramp-cleanup-connection vec t t)
+                     (throw 'uname-changed (tramp-maybe-open-connection vec)))))
+                (tramp-queue-command-send vec)
+                (tramp-get-connection-property vec "uname" nil)))))
 
       ;; Try to set up the coding system correctly.
       ;; CCC this can't be the right way to do it.  Hm.
@@ -4657,7 +4661,7 @@ process to set up.  VEC specifies the connection."
 
       ;; Dump stty settings in the traces.
       (when (>= tramp-verbose 9)
-        (tramp-send-command vec "stty -a" t)))))
+        (tramp-queue-command vec "stty -a" t)))))
 
 ;; Old text from documentation of tramp-methods:
 ;; Using a uuencode/uudecode inline method is discouraged, please use one
