@@ -295,6 +295,16 @@ struct process_output_buffer
   struct process_output_buffer * next;
 };
 
+struct process_write_buffer
+{
+  int fd;
+  int buffer_size;
+  bool released;
+  char buffer[PROCESS_OUTPUT_MAX + 1];
+  struct process_write_buffer * prev;
+  struct process_write_buffer * next;
+};
+
 
 /*
  * The mutex used for controlling access to process_output_buffer_list.
@@ -316,8 +326,29 @@ process_output_buffer_list_mutex_unlock(void)
   sys_mutex_unlock(&process_output_buffer_list_mutex);
   errno = xerrno;
 }
+/*
+ * The mutex used for controlling access to process_output_buffer_list.
+ */
+static sys_mutex_t process_write_buffer_list_mutex;
+
+static void
+process_write_buffer_list_mutex_lock(void)
+{
+  int xerrno = errno;
+  sys_mutex_lock(&process_write_buffer_list_mutex);
+  errno = xerrno;
+}
+
+static void
+process_write_buffer_list_mutex_unlock(void)
+{
+  int xerrno = errno;
+  sys_mutex_unlock(&process_write_buffer_list_mutex);
+  errno = xerrno;
+}
 
 static struct process_output_buffer * process_output_buffer_list = NULL;
+static struct process_write_buffer * process_write_buffer_list = NULL;
 
 /*
  * The mutex used for controlling access to process_output_ready_fds fd_set.
@@ -344,8 +375,27 @@ process_output_ready_fds_mutex_unlock(void)
 static int process_output_consumer_ready_read_fd = -1;
 static int process_output_consumer_ready_write_fd = -1;
 
+static int process_writer_ready_read_fd = -1;
+static int process_writer_ready_write_fd = -1;
+
 static sys_mutex_t process_output_consumer_notification_mutex;
 static bool process_output_consumer_ready_has_notification = false;
+
+static void
+process_writer_write_ready_fd(void)
+{
+  char throwaway[1] = { '\n' };
+  // Does not matter if this succeeds or happens multiple times, since it just needs to wake up the writer thread
+  // and will converge correctly
+  emacs_write(process_writer_ready_write_fd, &throwaway, 1);
+}
+
+static void
+process_writer_drain_ready_fd(void)
+{
+  char throwaway[1024];
+  emacs_read(process_writer_ready_read_fd, &throwaway, 1024);
+}
 
 static bool
 process_output_consumer__locked_has_notification(void)
@@ -936,6 +986,187 @@ process_output_producer_thread(void * args)
   return NULL;
 }
 
+static char process_writer_thread__copy_buffer[PROCESS_OUTPUT_MAX];
+
+static void *
+process_writer_thread(void * args)
+{
+  struct timespec no_timeout = make_timespec(0, 0);
+
+  fd_set fds;
+  fd_set notify_fds;
+  FD_ZERO(&fds);
+
+  process_write_buffer_list_mutex_lock();
+  while (1)
+    {
+      FD_ZERO(&fds);
+      int notify_fd = process_writer_ready_read_fd;
+      int max_fd = notify_fd;
+      FD_SET(notify_fd, &notify_fds);
+      struct process_write_buffer * ptr = process_write_buffer_list;
+      while (ptr != NULL)
+	{
+	  if (!ptr->released && ptr->buffer_size > 0)
+	    {
+	      if (ptr->fd > max_fd)
+		{
+		  max_fd = ptr->fd;
+		}
+	      FD_SET(ptr->fd, &fds);
+	    }
+	  ptr = ptr->next;
+	}
+
+      process_write_buffer_list_mutex_unlock();
+      pselect(max_fd + 1, &notify_fds, &fds, NULL, NULL, NULL);
+      process_write_buffer_list_mutex_lock();
+      bool notified = false;
+      if (FD_ISSET(notify_fd, &notify_fds))
+	{
+	  // When the notify fd is set, try writing to every buffer since it won't be set in fds
+	  notified = true;
+
+	  process_writer_drain_ready_fd();
+	}
+
+      ptr = process_write_buffer_list;
+
+      while (ptr != NULL)
+	{
+	  if (ptr->released)
+	    {
+	      if (ptr->prev == NULL)
+		{
+		  process_write_buffer_list = ptr->next;
+		}
+	      else
+		{
+		  ptr->prev->next = ptr->next;
+		  if (ptr->next != NULL)
+		    {
+		      ptr->next->prev = ptr->prev;
+		    }
+		}
+	      void * old_buffer = ptr;
+	      ptr = ptr->next;
+
+	      xfree((void *)old_buffer);
+	      continue;
+	    }
+	  if (FD_ISSET(ptr->fd, &fds))
+	    {
+	      int fd = ptr->fd;
+	      int batch_size = PROCESS_OUTPUT_MAX;
+
+	      if (ptr->buffer_size < batch_size)
+		{
+		  batch_size = ptr->buffer_size;
+		}
+	      memcpy(process_writer_thread__copy_buffer, ptr->buffer, batch_size);
+
+	      process_write_buffer_list_mutex_unlock();
+	      int written_count = emacs_write (fd, process_writer_thread__copy_buffer, batch_size);
+	      int flags = FWRITE;
+	      ioctl (fd, TIOCFLUSH, &flags);
+	      process_write_buffer_list_mutex_lock();
+	      if (!written_count)
+		{
+		  if (!would_block (errno))
+		    {
+		      ptr->released = true;
+		    }
+		}
+	      ptr->buffer_size = ptr->buffer_size - written_count;
+
+	      if (written_count > 0 && ptr->buffer_size > 0)
+		{
+		  memcpy(ptr->buffer, ptr->buffer + written_count, ptr->buffer_size);
+		}
+	    }
+	  ptr = ptr->next;
+	}
+    }
+  return NULL;
+}
+
+static void
+process_write_buffer_release(int fd)
+{
+  process_write_buffer_list_mutex_lock();
+  struct process_write_buffer * buffer = process_write_buffer_list;
+  while (buffer != NULL && (buffer->released || buffer->fd != fd))
+    {
+      buffer = buffer->next;
+    }
+  if (buffer != NULL)
+    {
+      buffer->released = true;
+    }
+  process_write_buffer_list_mutex_unlock();
+}
+
+static bool
+process_write_output_flushed_p(int fd)
+{
+  process_write_buffer_list_mutex_lock();
+  struct process_write_buffer * buffer = process_write_buffer_list;
+  while (buffer != NULL && (buffer->released || buffer->fd != fd))
+    {
+      buffer = buffer->next;
+    }
+  bool flushed_p = true;
+  if (buffer != NULL)
+    {
+      flushed_p = buffer->buffer_size == 0;
+
+    }
+  process_write_buffer_list_mutex_unlock();
+  return flushed_p;
+}
+
+static ptrdiff_t
+process_write(int fd, void const * write_buffer, ptrdiff_t size)
+{
+  int written_size = 0;
+  process_write_buffer_list_mutex_lock();
+  struct process_write_buffer * buffer = process_write_buffer_list;
+  while (buffer != NULL && (buffer->released || buffer->fd != fd))
+    {
+      buffer = buffer->next;
+    }
+  if (buffer == NULL)
+    {
+      buffer = xmalloc(sizeof(struct process_write_buffer));
+      buffer->buffer_size = 0;
+      buffer->next = process_write_buffer_list;
+      if (process_write_buffer_list != NULL)
+	{
+	  process_write_buffer_list->prev = buffer;
+	}
+      process_write_buffer_list = buffer;
+      buffer->prev = NULL;
+      buffer->released = false;
+      buffer->fd = fd;
+    }
+
+  process_writer_write_ready_fd();
+  if (size > PROCESS_OUTPUT_MAX - buffer->buffer_size)
+    {
+      written_size = PROCESS_OUTPUT_MAX - buffer->buffer_size;
+    }
+  else
+    {
+      written_size = size;
+    }
+  memcpy(buffer->buffer + buffer->buffer_size, write_buffer, written_size);
+  buffer->buffer_size += written_size;
+
+  process_write_buffer_list_mutex_unlock();
+  return written_size;
+}
+
+
 /*
  * Called by the main thread to let the output producer thread know that a channel pid pair
  * is no longer going to be used.
@@ -1005,6 +1236,7 @@ process_output_producer_thread_init(void)
 {
   FD_ZERO(&process_output_buffers_ready_fds);
   sys_mutex_init(&process_output_buffer_list_mutex);
+  sys_mutex_init(&process_write_buffer_list_mutex);
   sys_mutex_init(&process_output_ready_fds_mutex);
   sys_mutex_init(&process_output_producer_notification_mutex);
   sys_mutex_init(&process_output_consumer_notification_mutex);
@@ -1037,6 +1269,24 @@ process_output_producer_thread_init(void)
     {
       emacs_perror ("fcntl");
     }
+
+  if (fcntl (fds[1], F_SETFL, O_NONBLOCK) != 0)
+    {
+      emacs_perror ("fcntl");
+    }
+
+  process_writer_ready_read_fd = fds[0];
+  process_writer_ready_write_fd = fds[1];
+
+  if (emacs_pipe (fds) < 0)
+    {
+      emacs_perror("Failed to create not empty fd");
+    }
+
+  if (fcntl (fds[0], F_SETFL, O_NONBLOCK) != 0)
+    {
+      emacs_perror ("fcntl");
+    }
   if (fcntl (fds[1], F_SETFL, O_NONBLOCK) != 0)
     {
       emacs_perror ("fcntl");
@@ -1050,6 +1300,12 @@ process_output_producer_thread_init(void)
   if (pthread_create(&process_buffer_thread, NULL, &process_output_producer_thread, NULL) != 0)
     {
       emacs_perror("Failed to create process output consumer");
+    }
+  pthread_t process_write_thread;
+
+  if (pthread_create(&process_write_thread, NULL, &process_writer_thread, NULL) != 0)
+    {
+      emacs_perror("Failed to create process write thread");
     }
 }
 
@@ -1891,6 +2147,7 @@ Interactively, it will kill the current buffer's process.  */)
 #endif
 
   p->raw_status_new = 0;
+  process_write_buffer_release(p->outfd);
   if (NETCONN1_P (p) || SERIALCONN1_P (p) || PIPECONN1_P (p))
     {
       pset_status (p, list2 (Qexit, make_fixnum (0)));
@@ -1904,6 +2161,7 @@ Interactively, it will kill the current buffer's process.  */)
 	record_kill_process (p, Qnil);
 
       process_output_consumer_deactivate_fd(p->infd, p->pid);
+      process_write_buffer_release(p->outfd);
 
       if (p->infd >= 0)
 	{
@@ -5592,6 +5850,7 @@ deactivate_process (Lisp_Object proc)
 
   inchannel = p->infd;
   eassert (inchannel < FD_SETSIZE);
+  process_write_buffer_release(p->outfd);
   if (inchannel >= 0)
     {
       // Just in case it wasn't cleaned up elsewhere
@@ -6194,7 +6453,7 @@ wait_reading_process_output (intmax_t time_limit, int nsecs, int read_kbd,
 	  timeout = timespec_sub (end_time, now);
 	}
       else
-	timeout = make_timespec (wait < TIMEOUT ? 0 : 100000, 0);
+	timeout = make_timespec (wait < TIMEOUT ? 0 : 100, 0);
 
       /* Normally we run timers here.
 	 But not if wait_for_cell; in those cases,
@@ -6222,7 +6481,6 @@ wait_reading_process_output (intmax_t time_limit, int nsecs, int read_kbd,
 	  if (read_kbd != 0
 	      && requeued_events_pending_p ())
               {
-                  printf("BREAKING\n");
                   break;
               }
 
@@ -7518,7 +7776,7 @@ send_process (Lisp_Object proc, const char *buf, ptrdiff_t len,
 		written = emacs_gnutls_write (p, cur_buf, cur_len);
 	      else
 #endif
-		written = emacs_write_sig (outfd, cur_buf, cur_len);
+		written = process_write (outfd, cur_buf, cur_len);
 	      rv = (written ? 0 : -1);
 	      if (p->read_output_delay > 0
 		  && p->adaptive_read_buffering == 1)
@@ -7580,6 +7838,11 @@ send_process (Lisp_Object proc, const char *buf, ptrdiff_t len,
 	      else
 		/* This is a real error.  */
 		report_file_error ("Writing to process", proc);
+	    }
+	  while (!process_write_output_flushed_p(p->outfd))
+	    {
+	      wait_reading_process_output (0, 1 * 1000 * 1000,
+		0, 0, Qnil, NULL, 0);
 	    }
 	  cur_buf += written;
 	  cur_len -= written;
