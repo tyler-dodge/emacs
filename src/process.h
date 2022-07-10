@@ -134,6 +134,8 @@ struct Lisp_Process
     /* Descriptors that were created for this process and that need
        closing.  Unused entries are negative.  */
     int open_fd[PROCESS_OPEN_FDS];
+    /* Event-count of last event in which this process initialized.  */
+    EMACS_INT init_tick;
     /* Event-count of last event in which this process changed status.  */
     EMACS_INT tick;
     /* Event-count of last such event reported.  */
