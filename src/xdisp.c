@@ -2537,26 +2537,11 @@ get_glyph_string_clip_rects (struct glyph_string *s, NativeRectangle *rects, int
       r.width = min (r.width, glyph->pixel_width);
 
       /* If r.y is below window bottom, ensure that we still see a cursor.  */
-      height = min (glyph->ascent + glyph->descent,
-		    min (FRAME_LINE_HEIGHT (s->f), s->row->visible_height));
+      height = max(glyph->ascent + glyph->descent,
+		    max(FRAME_LINE_HEIGHT (s->f), s->row->visible_height)) + s->row->extra_line_spacing;
       max_y = window_text_bottom_y (s->w) - height;
       max_y = WINDOW_TO_FRAME_PIXEL_Y (s->w, max_y);
-      if (s->ybase - glyph->ascent > max_y)
-	{
-	  r.y = max_y;
-	  r.height = height;
-	}
-      else
-	{
-	  /* Don't draw cursor glyph taller than our actual glyph.  */
-	  height = max (FRAME_LINE_HEIGHT (s->f), glyph->ascent + glyph->descent);
-	  if (height < r.height)
-	    {
-	      max_y = r.y + r.height;
-	      r.y = min (max_y, max (r.y, s->ybase + glyph->descent - height));
-	      r.height = min (max_y - r.y, height);
-	    }
-	}
+      r.height = height + s->row->extra_line_spacing;
     }
 
   if (s->row->clip)
@@ -2681,13 +2666,13 @@ get_phys_cursor_geometry (struct window *w, struct glyph_row *row,
     }
 
   /* If y is below window bottom, ensure that we still see a cursor.  */
-  h0 = min (FRAME_LINE_HEIGHT (f), row->visible_height);
+  h0 = FRAME_LINE_HEIGHT (f);
 
   h = max (h0, ascent + glyph->descent);
   /* Don't let the cursor exceed the dimensions of the row, so that
      the upper/lower side of the box aren't clipped.  */
-  h = min (h, row->height);
-  h0 = min (h0, ascent + glyph->descent);
+  h = max (h, row->height) + row->extra_line_spacing;
+  h0 = max (h0, row->height) + row->extra_line_spacing;
 
   y0 = WINDOW_TAB_LINE_HEIGHT (w) + WINDOW_HEADER_LINE_HEIGHT (w);
   if (y < y0)
@@ -12545,6 +12530,7 @@ resize_mini_window (struct window *w, bool exact_p)
   else
     {
       struct it it;
+
       int unit = FRAME_LINE_HEIGHT (f);
       int height, max_height;
       struct text_pos start;
@@ -12556,6 +12542,7 @@ resize_mini_window (struct window *w, bool exact_p)
 	  old_current_buffer = current_buffer;
 	  set_buffer_internal (XBUFFER (w->contents));
 	}
+      unit += XFIXNUM(BVAR(current_buffer, extra_line_spacing));
 
       init_iterator (&it, w, BEGV, BEGV_BYTE, NULL, DEFAULT_FACE_ID);
 
@@ -12591,7 +12578,6 @@ resize_mini_window (struct window *w, bool exact_p)
 	}
       else
 	height = it.current_y + it.max_ascent + it.max_descent;
-      height -= min (it.extra_line_spacing, it.max_extra_line_spacing);
 
       /* Compute a suitable window start.  */
       if (height > max_height)
@@ -29412,6 +29398,7 @@ fill_glyph_string (struct glyph_string *s, int face_id,
         = FACE_FROM_ID (s->f, FACE_FOR_CHAR (s->f, s->face,
 					     s->first_glyph->u.ch, -1, Qnil));
       prepare_face_for_display (s->f, s->face);
+      s->ybase -= s->row->extra_line_spacing / 2;
     }
 
   /* If the specified font could not be loaded, use the frame's font,
@@ -29425,8 +29412,7 @@ fill_glyph_string (struct glyph_string *s, int face_id,
     }
 
   /* Adjust base line for subscript/superscript text.  */
-  s->ybase += voffset;
-
+  s->ybase += voffset + s->row->extra_line_spacing / 2;
   eassert (s->face && s->face->gc);
   return glyph - s->row->glyphs[s->area];
 }
@@ -29531,7 +29517,7 @@ fill_stretch_glyph_string (struct glyph_string *s, int start, int end)
     s->width += glyph->pixel_width;
 
   /* Adjust base line for subscript/superscript text.  */
-  s->ybase += voffset;
+  s->ybase += voffset + s->row->extra_line_spacing / 2;
 
   /* The case that face->gc == 0 is handled when drawing the glyph
      string by calling prepare_face_for_display.  */
