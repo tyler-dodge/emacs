@@ -383,6 +383,9 @@ static int process_output_consumer_ready_write_fd = -1;
 static int process_writer_ready_read_fd = -1;
 static int process_writer_ready_write_fd = -1;
 
+static int process_writer_complete_read_fd = -1;
+static int process_writer_complete_write_fd = -1;
+
 static sys_mutex_t process_output_consumer_notification_mutex;
 static bool process_output_consumer_ready_has_notification = false;
 
@@ -398,8 +401,24 @@ process_writer_write_ready_fd(void)
 static void
 process_writer_drain_ready_fd(void)
 {
-  char throwaway[1024];
-  emacs_read(process_writer_ready_read_fd, &throwaway, 1024);
+  char throwaway[1];
+  emacs_read(process_writer_ready_read_fd, &throwaway, 1);
+}
+
+static void
+process_writer_write_complete_fd(void)
+{
+  char throwaway[1] = { '\n' };
+  // Does not matter if this succeeds or happens multiple times, since it just needs to wake up the writer thread
+  // and will converge correctly
+  emacs_write(process_writer_complete_write_fd, &throwaway, 1);
+}
+
+static void
+process_writer_drain_complete_fd(void)
+{
+  char throwaway[1];
+  emacs_read(process_writer_complete_read_fd, &throwaway, 1);
 }
 
 static bool
@@ -449,8 +468,8 @@ process_output_consumer_drain_ready_notification_fd(void)
       return 0;
     }
 
-  char throwaway[128];
-  int output = emacs_read(process_output_consumer_ready_read_fd, throwaway, 128);
+  char throwaway[1];
+  int output = emacs_read(process_output_consumer_ready_read_fd, throwaway, 1);
   if (output == -1)
     {
       if (!would_block(errno))
@@ -491,6 +510,23 @@ process_output_producer__locked_set_notification(bool new_value)
 }
 
 /*
+ * Called by producer to signal that there is output
+ * available in the process_output_buffers
+ */
+static void
+process_output_producer_write_notification_fd(void)
+{
+  if (!process_output_producer__locked_has_notification())
+    {
+      char throwaway[1] = { '\n' };
+      if (emacs_write(process_output_producer_ready_write_fd, &throwaway, 1) > 0)
+	{
+	  process_output_producer__locked_set_notification(true);
+	}
+    }
+}
+
+/*
  * Called by both the producer to signal
  * there is no more output available in any buffers.
  */
@@ -517,23 +553,6 @@ process_output_producer_drain_notification_fd(void)
   return output;
 }
 
-
-/*
- * Called by producer to signal that there is output
- * available in the process_output_buffers
- */
-static void
-process_output_producer_write_notification_fd(void)
-{
-  if (!process_output_producer__locked_has_notification())
-    {
-      char throwaway[1] = { '\n' };
-      if (emacs_write(process_output_producer_ready_write_fd, &throwaway, 1) > 0)
-	{
-	  process_output_producer__locked_set_notification(true);
-	}
-    }
-}
 
 /* The max fd used by process_output_buffers. Can be safely accessed by the consumer thread */
 static int process_output_buffers_ready_max_fd = 0;
@@ -690,7 +709,7 @@ process_output_consumer_wait_for_fd_cancel()
     if (waiting)
       {
 	process_output_consumer_waiting_fd = -1;
-	process_output_producer_drain_notification_fd();
+	process_output_consumer_write_ready_notification_fd();
       }
 
   process_output_buffer_list_mutex_unlock();
@@ -906,7 +925,7 @@ process_output_producer_thread(void * args)
 
 	  const int outputSize = PROCESS_OUTPUT_MAX - buffer->buffer_size;
 	  int updatedSize;
-	  if (outputSize == 0 || buffer->ignored || (process_output_consumer_waiting_fd > 0 && buffer->fd != process_output_consumer_waiting_fd))
+	  if (outputSize == 0 || buffer->ignored)
 	    {
 	      buffer = buffer->next;
 	      continue;
@@ -974,13 +993,13 @@ process_output_producer_thread(void * args)
 		  process_output_buffer_producer_set_ready_fd(buffer);
 		}
 	    }
-
 	  buffer = buffer->next;
 	}
       if (!has_output)
 	{
 	  process_output_producer_drain_notification_fd();
 	}
+
       process_output_buffer_list_mutex_unlock();
 
       struct timespec * select_timeout = readingCount == 0 ? NULL : &no_timeout;
@@ -1006,6 +1025,7 @@ process_writer_thread(void * args)
   process_write_buffer_list_mutex_lock();
   while (1)
     {
+      bool write_remaining = false;
       FD_ZERO(&fds);
       int notify_fd = process_writer_ready_read_fd;
       int max_fd = notify_fd;
@@ -1082,7 +1102,6 @@ process_writer_thread(void * args)
                   ioctl (fd, TIOCFLUSH, &flags);
                   delay_next_write = true;
                 }
-
               process_write_buffer_list_mutex_lock();
               if (!written_count)
                 {
@@ -1096,6 +1115,11 @@ process_writer_thread(void * args)
                   ptr->buffer_size = ptr->buffer_size - written_count;
                 }
 
+	      if (ptr->buffer_size > 0)
+		{
+		  write_remaining = true;
+		}
+
               if (written_count > 0 && ptr->buffer_size > 0)
                 {
                   memcpy(ptr->buffer, ptr->buffer + written_count, ptr->buffer_size);
@@ -1107,6 +1131,11 @@ process_writer_thread(void * args)
             }
           ptr = ptr->next;
         }
+
+      if (!write_remaining)
+	{
+	  process_writer_write_complete_fd();
+	}
     }
   return NULL;
 }
@@ -1229,6 +1258,7 @@ process_output_consumer_ignore_fd(int channel, int pid)
     {
       buffer->ignored = true;
       process_output_buffer_consumer_clear_ready_fd(buffer);
+      process_output_consumer_write_ready_notification_fd();
     }
   process_output_buffer_list_mutex_unlock();
 }
@@ -1244,6 +1274,7 @@ process_output_consumer_unignore_fd(int channel, int pid)
   if (buffer != NULL)
     {
       buffer->ignored = false;
+      process_output_consumer_write_ready_notification_fd();
     }
   process_output_buffer_list_mutex_unlock();
 }
@@ -1263,7 +1294,7 @@ process_output_producer_thread_init(void)
   sys_mutex_init(&process_output_producer_notification_mutex);
   sys_mutex_init(&process_output_consumer_notification_mutex);
 
-  int fds[2];
+  int fds[2] = { -1, -1 };
   if (emacs_pipe (fds) < 0)
     {
       emacs_perror("Failed to create not empty fd");
@@ -1282,6 +1313,8 @@ process_output_producer_thread_init(void)
   process_output_consumer_ready_read_fd = fds[0];
   process_output_consumer_ready_write_fd = fds[1];
 
+  fds[0] = -1; fds[1] = -1;
+
   if (emacs_pipe (fds) < 0)
     {
       emacs_perror("Failed to create not empty fd");
@@ -1299,6 +1332,27 @@ process_output_producer_thread_init(void)
 
   process_writer_ready_read_fd = fds[0];
   process_writer_ready_write_fd = fds[1];
+
+  fds[0] = -1; fds[1] = -1;
+
+  if (emacs_pipe (fds) < 0)
+    {
+      emacs_perror("Failed to create not empty fd");
+    }
+
+  if (fcntl (fds[0], F_SETFL, O_NONBLOCK) != 0)
+    {
+      emacs_perror ("fcntl");
+    }
+
+  if (fcntl (fds[1], F_SETFL, O_NONBLOCK) != 0)
+    {
+      emacs_perror ("fcntl");
+    }
+
+  process_writer_complete_read_fd = fds[0];
+  process_writer_complete_write_fd = fds[1];
+  fds[0] = -1; fds[1] = -1;
 
   if (emacs_pipe (fds) < 0)
     {
@@ -6794,7 +6848,6 @@ wait_reading_process_output (intmax_t time_limit, int nsecs, int read_kbd,
 		   && FD_ISSET (wait_proc->infd, &tls_available))))
 	    timeout = make_timespec (0, 0);
 #endif
-	  int ready_fd = process_output_producer_ready_read_fd;
 	  int merged_max_desc = max_desc;
 	  // Reseting available here because we don't want to react to fds being read by background reader
 	  // However, we still want it for filtering tls_fds before.
@@ -6808,14 +6861,22 @@ wait_reading_process_output (intmax_t time_limit, int nsecs, int read_kbd,
 	    timeout = short_timeout;
 #endif
 
-	  if (ready_fd > 0)
+	  if (process_output_producer_ready_read_fd > 0)
 	    {
-	      FD_SET(ready_fd, &Available);
-	      if (ready_fd > max_desc)
+	      FD_SET(process_output_producer_ready_read_fd, &Available);
+	      if (process_output_producer_ready_read_fd > max_desc)
 		{
-		  merged_max_desc = ready_fd;
+		  merged_max_desc = process_output_producer_ready_read_fd;
 		}
 	    }
+	  if (process_writer_complete_read_fd > 0)
+	    {
+	      FD_SET(process_writer_complete_read_fd, &Available);
+	      if (process_writer_complete_read_fd > max_desc)
+		{
+		  merged_max_desc = process_writer_complete_read_fd;
+		}
+	  }
 	  /* Non-macOS HAVE_GLIB builds call thread_select in xgselect.c.  */
 #if defined HAVE_GLIB && !defined HAVE_NS
 	  nfds = xg_select (merged_max_desc + 1,
@@ -6832,6 +6893,11 @@ wait_reading_process_output (intmax_t time_limit, int nsecs, int read_kbd,
 				(check_write ? &Writeok : 0),
 				NULL, &timeout, NULL);
 #endif	/* !HAVE_GLIB */
+
+	  if (FD_ISSET(process_writer_complete_read_fd, &Available))
+	    {
+	      process_writer_drain_complete_fd();
+	    }
 	  FD_ZERO(&process_ready);
 	  int ready_count = process_output_buffers_ready_copy_fd_set(&process_ready);
 
@@ -7798,7 +7864,7 @@ send_process (Lisp_Object proc, const char *buf, ptrdiff_t len,
 		written = emacs_gnutls_write (p, cur_buf, cur_len);
 	      else
 #endif
-		if (NETCONN1_P(p))
+		if (NETCONN1_P(p) || !process_output_consumer_fd_tracked_p(p->infd))
 		  {
 		    written = emacs_write_sig(outfd, cur_buf, cur_len);
 		  }
@@ -7869,12 +7935,18 @@ send_process (Lisp_Object proc, const char *buf, ptrdiff_t len,
 		/* This is a real error.  */
 		report_file_error ("Writing to process", proc);
 	    }
-	  while (!process_write_output_flushed_p(p->init_tick, p->outfd))
+	  while (!NETCONN1_P(p) && process_output_consumer_fd_tracked_p(p->infd) && !process_write_output_flushed_p(p->init_tick, p->outfd))
 	    {
+	      // There is an expectation that send string does not read output for strings below a certain length
+	      bool read_output = len > 1024;
 	      //TODO: Switch this to being managed via a fd so that the main loop is interrupted
 	      // when writing is complete
-	      wait_reading_process_output (0,  20 * 1000 * 1000,
-		1, true, Qnil, NULL, 0);
+	      if (read_output)
+		{
+		  wait_reading_process_output (0,  20 * 1000 * 1000,
+		    1, true, Qnil, NULL, 0);
+		}
+	      // TODO: Stop spinning and use a pselect
 	    }
 	  process_output_consumer_unignore_fd(p->outfd, p->pid);
 	  cur_buf += written;
