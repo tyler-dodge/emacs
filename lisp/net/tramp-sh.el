@@ -2163,7 +2163,7 @@ file names."
 	  ;; When newname did exist, we have wrong cached values.
 	  (when t2
 	    (with-parsed-tramp-file-name newname v2
-	      (tramp-flush-file-properties v2 v2-localname)))))))
+	      (tramp-flush-file-properties v2 v2-localname))))))))))
 
 (defun tramp-do-copy-or-rename-file-via-buffer
     (op filename newname ok-if-already-exists keep-date)

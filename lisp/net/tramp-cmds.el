@@ -29,6 +29,7 @@
 ;;; Code:
 
 (require 'tramp)
+(require 'tramp-crypt)
 
 ;; Pacify byte-compiler.
 (declare-function mml-mode "mml")
