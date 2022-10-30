@@ -117,8 +117,6 @@
     (let ((max-specpdl-size (* 2 max-specpdl-size)))
       (require 'tramp-gvfs))))
 
-(require 'tramp-crypt)
-
 (autoload 'dired-uncache "dired")
 (autoload 'url-tramp-convert-url-to-tramp "url-tramp")
 (defvar url-handler-mode-hook)
