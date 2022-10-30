@@ -34,6 +34,7 @@
 ;;; Code:
 
 (require 'tramp)
+(require 'tramp-crypt)
 
 (defvar process-file-return-signal-string)
 

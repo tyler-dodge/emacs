@@ -82,6 +82,7 @@
 (require 'tramp-compat)
 (require 'tramp-loaddefs)
 (require 'time-stamp)
+(require 'tramp-crypt)
 
 ;;; -- Cache --
 
