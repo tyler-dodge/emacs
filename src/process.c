@@ -395,7 +395,7 @@ process_writer_write_ready_fd(void)
   char throwaway[1] = { '\n' };
   // Does not matter if this succeeds or happens multiple times, since it just needs to wake up the writer thread
   // and will converge correctly
-  emacs_write_sig(process_writer_ready_write_fd, &throwaway, 1);
+  write(process_writer_ready_write_fd, &throwaway, 1);
 }
 
 static void
@@ -449,7 +449,7 @@ process_output_consumer_write_ready_notification_fd(void)
   if (!process_output_consumer__locked_has_notification())
     {
       char throwaway[1] = { '\n' };
-      if (emacs_write_sig(process_output_consumer_ready_write_fd, &throwaway, 1) > 0)
+      if (write(process_output_consumer_ready_write_fd, &throwaway, 1) > 0)
 	{
 	  process_output_consumer__locked_set_notification(true);
 	}
