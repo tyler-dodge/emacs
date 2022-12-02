@@ -3781,7 +3781,8 @@ ns_draw_image_relief (struct glyph_string *s)
   bool raised_p, top_p, bot_p, left_p, right_p;
   int extra_x, extra_y;
   int x = s->x;
-  int y = s->ybase - image_ascent (s->img, s->face, &s->slice);
+  int line_spacing = (s && s->row && s->row->extra_line_spacing / 2) || 0;
+  int y = s->ybase - image_ascent (s->img, s->face, &s->slice) + line_spacing;
 
   /* If first glyph of S has a left box line, start drawing it to the
      right of that line.  */
@@ -3868,6 +3869,7 @@ ns_dumpglyphs_image (struct glyph_string *s, NSRect r)
    -------------------------------------------------------------------------- */
 {
   EmacsImage *img = s->img->pixmap;
+  int line_spacing = (s && s->row && s->row->extra_line_spacing / 2) || 0;
   int box_line_vwidth = max (s->face->box_horizontal_line_width, 0);
   int x = s->x, y = s->ybase - image_ascent (s->img, s->face, &s->slice);
   int bg_x, bg_y, bg_height;
@@ -3883,7 +3885,7 @@ ns_dumpglyphs_image (struct glyph_string *s, NSRect r)
 
   bg_x = x;
   bg_y =  s->slice.y == 0 ? s->y : s->y + box_line_vwidth;
-  bg_height = s->height;
+  bg_height = max(s->height, (s->row && (s->row->height)) || 0);
   /* other terms have this, but was causing problems w/tabbar mode */
   /* - 2 * box_line_vwidth; */
 
@@ -3918,7 +3920,7 @@ ns_dumpglyphs_image (struct glyph_string *s, NSRect r)
          or whatever as required.  This is kind of backwards, but
          there's no way to apply the transform to the image without
          creating a whole new bitmap.  */
-      NSRect dr = NSMakeRect (x, y, s->slice.width, s->slice.height);
+      NSRect dr = NSMakeRect (x, y, s->slice.width, bg_height);
       NSRect ir = NSMakeRect (0, 0, [img size].width, [img size].height);
 
       NSAffineTransform *setOrigin = [NSAffineTransform transform];
@@ -3931,7 +3933,7 @@ ns_dumpglyphs_image (struct glyph_string *s, NSRect r)
          bit.  */
       NSRectClip (dr);
 
-      [setOrigin translateXBy:x - s->slice.x yBy:y - s->slice.y];
+      [setOrigin translateXBy:x - s->slice.x yBy:bg_y + (bg_height - s->slice.height) / 2];
       [setOrigin concat];
 
       NSAffineTransform *doTransform = [NSAffineTransform transform];
@@ -3947,7 +3949,6 @@ ns_dumpglyphs_image (struct glyph_string *s, NSRect r)
       if (! img->smoothing)
         [[NSGraphicsContext currentContext]
           setImageInterpolation:NSImageInterpolationNone];
-
       [img drawInRect:ir fromRect:ir
             operation:NSCompositingOperationSourceOver
              fraction:1.0 respectFlipped:YES hints:nil];
