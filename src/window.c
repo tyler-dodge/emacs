@@ -1,4 +1,4 @@
-/* Window creation, deletion and examination for GNU Emacs.
+/* Window deletion, creation and examination for GNU Emacs.
    Does not include redisplay.
    Copyright (C) 1985-1987, 1993-1998, 2000-2022 Free Software
    Foundation, Inc.
@@ -5335,7 +5335,7 @@ shrink_mini_window (struct window *w)
 {
   struct frame *f = XFRAME (w->frame);
   int delta = (window_body_height (w, WINDOW_BODY_IN_PIXELS)
-	       - FRAME_LINE_HEIGHT (f));
+    - (FRAME_LINE_HEIGHT (f) * 1.5 + f->extra_line_spacing));
 
   eassert (MINI_WINDOW_P (w));
 
