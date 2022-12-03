@@ -402,7 +402,7 @@ static void
 process_writer_drain_ready_fd(void)
 {
   char throwaway[1];
-  emacs_read(process_writer_ready_read_fd, &throwaway, 1);
+  read(process_writer_ready_read_fd, &throwaway, 1);
 }
 
 static void
@@ -418,7 +418,7 @@ static void
 process_writer_drain_complete_fd(void)
 {
   char throwaway[1];
-  emacs_read(process_writer_complete_read_fd, &throwaway, 1);
+  read(process_writer_complete_read_fd, &throwaway, 1);
 }
 
 static bool
@@ -469,7 +469,7 @@ process_output_consumer_drain_ready_notification_fd(void)
     }
 
   char throwaway[1];
-  int output = emacs_read(process_output_consumer_ready_read_fd, throwaway, 1);
+  int output = read(process_output_consumer_ready_read_fd, throwaway, 1);
   if (output == -1)
     {
       if (!would_block(errno))
@@ -539,7 +539,7 @@ process_output_producer_drain_notification_fd(void)
     }
 
   char throwaway[1];
-  int output = emacs_read(process_output_producer_ready_read_fd, throwaway, 1);
+  int output = read(process_output_producer_ready_read_fd, throwaway, 1);
   if (output == -1)
     {
       if (!would_block(errno))
@@ -936,7 +936,7 @@ process_output_producer_thread(void * args)
 	    {
 	      process_output_buffer_list_mutex_unlock();
 	      FD_SET(fd, &tracked_fds);
-	      updatedSize = emacs_read(fd, process_output_producer_copy_buffer, outputSize);
+	      updatedSize = read(fd, process_output_producer_copy_buffer, outputSize);
 
 	      if (updatedSize > 0)
 		{
