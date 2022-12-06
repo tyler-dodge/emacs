@@ -320,62 +320,59 @@ struct process_output_buffer_id {
   int fd;
 };
 
-// mutexes
-static void process_output_buffer_list_mutex_lock(void);
-static void process_output_buffer_list_mutex_unlock(void);
-
-static void process_write_buffer_list_mutex_lock(void);
-static void process_write_buffer_list_mutex_unlock(void);
+static void * process_output_producer_thread_start(void *);
+static void process_output_producer_thread_init(void);
 
 static void process_output_ready_fds_mutex_lock(void);
 static void process_output_ready_fds_mutex_unlock(void);
 
-// atomics
-static bool process_output_consumer__locked_has_notification(void);
-static void process_output_consumer__locked_set_notification(bool);
+static bool process_output_producer_notification_p(void);
+static void process_output_producer_notification_set(bool);
 
-static bool process_output_producer__locked_has_notification(void);
-static void process_output_producer__locked_set_notification(bool);
+static void process_output_consumer_ready_notification_fd_write(void);
+static int process_output_consumer_ready_notification_fd_drain(void);
 
-// fds
-static void process_writer_write_ready_fd(void);
-static void process_writer_drain_ready_fd(void);
+static void process_output_producer_notification_fd_write(void);
+static int process_output_producer_notification_fd_drain(void);
 
-static void process_writer_write_complete_fd(void);
-static void process_writer_drain_complete_fd(void);
+static void process_output_buffer_list_mutex_lock(void);
+static void process_output_buffer_list_mutex_unlock(void);
+static int process_output_buffer_list_max_fd(void);
+static struct process_output_buffer * process_output_buffer_list_get(int, int);
+static int process_output_buffer_list_ready_copy_fd_set(fd_set *);
 
-static void process_output_consumer_write_ready_notification_fd(void);
-static int process_output_consumer_drain_ready_notification_fd(void);
+static void process_output_buffer_producer_ready_fd_set(struct process_output_buffer *);
+static void process_output_buffer_consumer_ready_fd_clear(struct process_output_buffer *);
 
-static void process_output_producer_write_notification_fd(void);
-static int process_output_producer_drain_notification_fd(void);
-
-// thread starters
-static void * process_output_producer_thread(void *);
-static void * process_writer_thread(void *);
-static void process_output_producer_thread_init(void);
-
-static struct process_output_buffer * process_output_buffer_get_active_by_channel_pid(int, int);
-static int process_output_buffers_ready_copy_fd_set(fd_set *);
-static int process_output_buffer_max_fd(void);
-static void process_output_buffer_consumer_clear_ready_fd(struct process_output_buffer *);
-static void process_output_buffer_producer_set_ready_fd(struct process_output_buffer *);
-static void process_output_consumer_wait_for_fd(int);
-static void process_output_consumer_wait_for_fd_cancel();
+// Process Output
 static ptrdiff_t process_output_consumer_read(int, int, void *, ptrdiff_t);
-static void process_output_consumer_track_fd(int, int, int, bool);
-static void process_write_buffer_release(int, int);
-static bool process_write_output_flushed_p(int, int);
-static ptrdiff_t process_write(int, int, void const *, ptrdiff_t);
-
+static bool process_output_consumer_notification_p(void);
+static void process_output_consumer_notification_set(bool);
+static void process_output_consumer_child_signal_fds_transfer_ignore(void);
+static void process_output_consumer_child_signal_fds_ignore(int channel, int pid);
+static void process_output_consumer_fd_wait(int);
+static void process_output_consumer_fd_wait_cancel(void);
+static void process_output_consumer_fd_track(int, int, int, bool);
 static bool process_output_consumer_fd_tracked_p(int);
-static void process_output_consumer_deactivate_fd(int, int);
-static void process_output_consumer_ignore_fd(int, int);
-static void process_output_consumer_unignore_fd(int, int);
-static void process_output_buffer_consumer_clear_ready_fd(struct process_output_buffer * buffer);
-static struct process_output_buffer * process_output_buffer_get_active_by_channel_pid(int channel, int pid);
-static void process_output_consumer_child_signal_transfer_fds(void);
-static void process_output_consumer_child_signal_ignore_fd(int channel, int pid);
+static void process_output_consumer_fd_deactivate(int, int);
+static void process_output_consumer_fd_ignore(int, int);
+static void process_output_consumer_fd_unignore(int, int);
+
+
+// Process Input
+static ptrdiff_t process_write(int, int, void const *, ptrdiff_t);
+static void process_write_buffer_list_mutex_lock(void);
+static void process_write_buffer_list_mutex_unlock(void);
+static void process_write_ready_fd_write(void);
+static void process_write_ready_fd_drain(void);
+static void process_write_complete_fd_write(void);
+static void process_write_complete_fd_drain(void);
+static bool process_write_output_flushed_p(int, int);
+static void process_write_buffer_release(int, int);
+static void * process_write_thread_start(void *);
+
+// internal
+static struct process_output_buffer * process_output_buffer_list_get(int channel, int pid);
 
 /* Signals that the consumer is ready for the producer to produce a new output buffer */
 static int process_output_consumer_ready_read_fd = -1;
@@ -396,10 +393,19 @@ static int process_output_producer_ready_write_fd = -1;
 
 static sys_mutex_t process_output_producer_notification_mutex;
 static bool process_output_producer_has_notification = false;
-static char process_writer_thread__copy_buffer[PROCESS_OUTPUT_MAX];
+static char process_write_thread__copy_buffer[PROCESS_OUTPUT_MAX];
 static int process_output_consumer_waiting_fd = -1;
 
+/*
+ * The head of the list of process_output_buffer pointers which represents the stdout buffer for a process that
+ * has not been processed yet by the emacs main event loop yet.
+ */
 static struct process_output_buffer * process_output_buffer_list = NULL;
+
+/*
+ * The head of the list of process_write_buffer pointers which represent the stdin queue for a process
+ * that has not been consumed yet.
+ */
 static struct process_write_buffer * process_write_buffer_list = NULL;
 /*
  * The mutex used for controlling access to process_output_ready_fds fd_set.
@@ -442,538 +448,11 @@ static int process_output_child_signal_ignored_fds_count = 0;
  */
 static sys_mutex_t process_output_buffer_list_mutex;
 
-static void
-process_output_buffer_list_mutex_lock(void)
-{
-  int xerrno = errno;
-  sys_mutex_lock(&process_output_buffer_list_mutex);
-  errno = xerrno;
-}
-
-static void
-process_output_buffer_list_mutex_unlock(void)
-{
-  int xerrno = errno;
-  sys_mutex_unlock(&process_output_buffer_list_mutex);
-  errno = xerrno;
-}
-
 /*
- * Adds the fd to a list to be later ignored by process_output_consumer_child_signal_transfer_fds
- */
-void
-process_output_consumer_child_signal_ignore_fd(int fd, int pid) {
-  eassert(process_output_child_signal_ignored_fds_count < PROCESS_OUTPUT_MAX_IGNORED_FDS);
-  process_output_child_signal_ignored_fds[process_output_child_signal_ignored_fds_count].pid = pid;
-  process_output_child_signal_ignored_fds[process_output_child_signal_ignored_fds_count].fd = fd;
-  process_output_child_signal_ignored_fds_count++;
-}
-
-
-static void
-process_write_buffer_list_mutex_lock(void)
-{
-  int xerrno = errno;
-  sys_mutex_lock(&process_write_buffer_list_mutex);
-  errno = xerrno;
-}
-
-static void
-process_write_buffer_list_mutex_unlock(void)
-{
-  int xerrno = errno;
-  sys_mutex_unlock(&process_write_buffer_list_mutex);
-  errno = xerrno;
-}
-
-static void
-process_output_ready_fds_mutex_lock(void)
-{
-  int xerrno = errno;
-  sys_mutex_lock(&process_output_ready_fds_mutex);
-  errno = xerrno;
-}
-
-static void
-process_output_ready_fds_mutex_unlock(void)
-{
-  int xerrno = errno;
-  sys_mutex_unlock(&process_output_ready_fds_mutex);
-  errno = xerrno;
-}
-
-static void
-process_writer_write_ready_fd(void)
-{
-  char throwaway[1] = { '\n' };
-  // Does not matter if this succeeds or happens multiple times, since it just needs to wake up the writer thread
-  // and will converge correctly
-  write(process_writer_ready_write_fd, &throwaway, 1);
-}
-
-static void
-process_writer_drain_ready_fd(void)
-{
-  char throwaway[1];
-  read(process_writer_ready_read_fd, &throwaway, 1);
-}
-
-static void
-process_writer_write_complete_fd(void)
-{
-  char throwaway[1] = { '\n' };
-  // Does not matter if this succeeds or happens multiple times, since it just needs to wake up the writer thread
-  // and will converge correctly
-  emacs_write(process_writer_complete_write_fd, &throwaway, 1);
-}
-
-static void
-process_writer_drain_complete_fd(void)
-{
-  char throwaway[1];
-  read(process_writer_complete_read_fd, &throwaway, 1);
-}
-
-static bool
-process_output_consumer__locked_has_notification(void)
-{
-  bool value;
-  sys_mutex_lock(&process_output_consumer_notification_mutex);
-  value = process_output_consumer_ready_has_notification;
-  sys_mutex_unlock(&process_output_consumer_notification_mutex);
-  return value;
-}
-
-static void
-process_output_consumer__locked_set_notification(bool new_value)
-{
-  sys_mutex_lock(&process_output_consumer_notification_mutex);
-  process_output_consumer_ready_has_notification = new_value;
-  sys_mutex_unlock(&process_output_consumer_notification_mutex);
-}
-
-/*
- * Called by the consumer to signal to the producer
- * that the consumer has changed the process_output_buffers list
- */
-static void
-process_output_consumer_write_ready_notification_fd(void)
-{
-  if (!process_output_consumer__locked_has_notification())
-    {
-      char throwaway[1] = { '\n' };
-      if (write(process_output_consumer_ready_write_fd, &throwaway, 1) > 0)
-	{
-	  process_output_consumer__locked_set_notification(true);
-	}
-    }
-}
-
-/*
- * Called by the producer to acknowledge
- * that the consumer has consumed all of the output available.
- */
-static int
-process_output_consumer_drain_ready_notification_fd(void)
-{
-  if (!process_output_consumer__locked_has_notification())
-    {
-      return 0;
-    }
-
-  char throwaway[1];
-  int output = read(process_output_consumer_ready_read_fd, throwaway, 1);
-  if (output == -1)
-    {
-      if (!would_block(errno))
-	{
-	  emacs_perror("Failed to drain ready fd");
-	}
-    }
-
-  process_output_consumer__locked_set_notification(false);
-
-  return output;
-}
-
-/**
- * Handles committing the changes produced by the signal handler. Should only be called by the main emacs event loop.
- */
-static void
-process_output_consumer_child_signal_transfer_fds(void)
-{
-  eassert(process_output_child_signal_ignored_fds_count < PROCESS_OUTPUT_MAX_IGNORED_FDS);
-  process_output_buffer_list_mutex_lock();
-  bool isUpdated = false;
-  for (int i = 0; i < process_output_child_signal_ignored_fds_count; i++) {
-    if (process_output_child_signal_ignored_fds[i].fd != -1) {
-      int channel = process_output_child_signal_ignored_fds[i].fd;
-      int pid = process_output_child_signal_ignored_fds[i].pid;
-      struct process_output_buffer * buffer = process_output_buffer_get_active_by_channel_pid(channel, pid);
-      if (buffer != NULL)
-	{
-	  buffer->ignored = true;
-	  isUpdated = true;
-	  process_output_buffer_consumer_clear_ready_fd(buffer);
-	}
-      process_output_child_signal_ignored_fds[i].fd = -1;
-      process_output_child_signal_ignored_fds[i].pid = -1;
-    }
-  }
-  if (isUpdated) {
-    process_output_consumer_write_ready_notification_fd();
-    process_tick++;
-  }
-  process_output_child_signal_ignored_fds_count = 0;
-  process_output_buffer_list_mutex_unlock();
-}
-
-static bool
-process_output_producer__locked_has_notification(void)
-{
-  bool value;
-  sys_mutex_lock(&process_output_producer_notification_mutex);
-  value = process_output_producer_has_notification;
-  sys_mutex_unlock(&process_output_producer_notification_mutex);
-  return value;
-}
-
-static void
-process_output_producer__locked_set_notification(bool new_value)
-{
-  sys_mutex_lock(&process_output_producer_notification_mutex);
-  process_output_producer_has_notification = new_value;
-  sys_mutex_unlock(&process_output_producer_notification_mutex);
-}
-
-/*
- * Called by producer to signal that there is output
- * available in the process_output_buffers
- */
-static void
-process_output_producer_write_notification_fd(void)
-{
-  if (!process_output_producer__locked_has_notification())
-    {
-      char throwaway[1] = { '\n' };
-      if (emacs_write(process_output_producer_ready_write_fd, &throwaway, 1) > 0)
-	{
-	  process_output_producer__locked_set_notification(true);
-	}
-    }
-}
-
-/*
- * Called by both the producer to signal
- * there is no more output available in any buffers.
- */
-static int
-process_output_producer_drain_notification_fd(void)
-{
-  if (!process_output_producer__locked_has_notification())
-    {
-      return 0;
-    }
-
-  char throwaway[1];
-  int output = read(process_output_producer_ready_read_fd, throwaway, 1);
-  if (output == -1)
-    {
-      if (!would_block(errno))
-	{
-	  emacs_perror("Failed to drain ready fd");
-	}
-    }
-
-  process_output_producer__locked_set_notification(false);
-
-  return output;
-}
-
-/*
- * Lookup active process output buffer by channel pid tuple.
- * Expected to be called while process_output_buffer_list_mutex_lock() is held.
- */
-static struct process_output_buffer *
-process_output_buffer_get_active_by_channel_pid(int channel, int pid)
-{
-  struct process_output_buffer * buffer = process_output_buffer_list;
-  while (buffer != NULL)
-    {
-      if (buffer->channel == channel && buffer->pid == pid && !buffer->released)
-	{
-	  return buffer;
-	}
-      buffer = buffer->next;
-    }
-  return NULL;
-}
-
-/*
- * Copies the fd_set of ready process_output_buffers for use in the main emacs event loop
- * to indicate which processes are available for consuming output.
- * Return the count of processes that have output available to consume.
- */
-static int
-process_output_buffers_ready_copy_fd_set(fd_set * destination)
-{
-  process_output_ready_fds_mutex_lock();
-  /* Should be safe because `process_output_consumer_waiting_fd` is only modified on main thread */
-  if (process_output_consumer_waiting_fd > -1)
-    {
-      FD_ZERO(destination);
-      if (FD_ISSET(process_output_consumer_waiting_fd, &process_output_buffers_ready_fds))
-	{
-	  FD_SET(process_output_consumer_waiting_fd, destination);
-	}
-    }
-  else
-    {
-      memcpy(destination, &process_output_buffers_ready_fds, sizeof(fd_set));
-    }
-  int count = process_output_buffers_ready_count;
-  process_output_ready_fds_mutex_unlock();
-  return count;
-}
-
-/*
- * Assumed to be called where process_output_buffer_list_mutex_lock is claimed
- */
-static int
-process_output_buffer_max_fd(void)
-{
-  int xerrno = errno;
-  struct process_output_buffer * buffer = process_output_buffer_list;
-  int max_fd = -1;
-  while (buffer != NULL)
-    {
-      if (!buffer->released && buffer->fd > max_fd)
-	{
-	  max_fd = buffer->fd;
-	}
-      buffer = buffer->next;
-    }
-  errno = xerrno;
-  return max_fd;
-}
-
-
-/*
- * Removes the ready fd from ready_fds for the given buffer. This is called by the consumer
- * to indicate that it has consumed all of the output from the given buffer.
- *Assumed to be called where process_output_buffer_list_mutex_lock is claimed.
- */
-static void
-process_output_buffer_consumer_clear_ready_fd(struct process_output_buffer * buffer)
-{
-  int fd = buffer->fd;
-  int xerrno = errno;
-  if (fd < 0)
-    {
-      error("Unexpected fd < 0\n");
-      return;
-    }
-  process_output_buffers_ready_max_fd = process_output_buffer_max_fd();
-  process_output_ready_fds_mutex_lock();
-  if (FD_ISSET(fd, &process_output_buffers_ready_fds))
-    {
-      process_output_buffers_ready_count--;
-      FD_CLR(fd, &process_output_buffers_ready_fds);
-    }
-  process_output_ready_fds_mutex_unlock();
-  errno = xerrno;
-}
-
-
-/*
- * Called by the producer thread to add fds to process_output_buffers_ready_fds.
- */
-static void
-process_output_buffer_producer_set_ready_fd(struct process_output_buffer * buffer)
-{
-  int fd = buffer->fd;
-  if (fd < 0)
-    {
-      error("Unexpected fd < 0\n");
-      return;
-    }
-  int xerrno = errno;
-  process_output_ready_fds_mutex_lock();
-  if (!FD_ISSET(fd, &process_output_buffers_ready_fds))
-    {
-      if (fd > process_output_buffers_ready_max_fd)
-	{
-	  process_output_buffers_ready_max_fd = fd;
-	}
-      process_output_buffers_ready_count++;
-      FD_SET(fd, &process_output_buffers_ready_fds);
-    }
-  process_output_ready_fds_mutex_unlock();
-  errno = xerrno;
-}
-
-static void
-process_output_consumer_wait_for_fd(int fd)
-{
-  process_output_buffer_list_mutex_lock();
-
-  process_output_consumer_waiting_fd = fd;
-  process_output_consumer_write_ready_notification_fd();
-
-  process_output_buffer_list_mutex_unlock();
-}
-
-static void
-process_output_consumer_wait_for_fd_cancel()
-{
-  process_output_buffer_list_mutex_lock();
-
-  const bool waiting = process_output_consumer_waiting_fd > -1;
-    if (waiting)
-      {
-	process_output_consumer_waiting_fd = -1;
-	process_output_consumer_write_ready_notification_fd();
-      }
-
-  process_output_buffer_list_mutex_unlock();
-}
-
-
-/*
- * Looks up the buffer corresponding to the channel pid tuple, and copies over
- * maximum tbyte into buf.
- *
- * Designed to behave similarly to read.
- *
- * Returns the actual size of the buffer written.
- *
- */
-static ptrdiff_t
-process_output_consumer_read(int channel, int pid, void * buf, ptrdiff_t nbyte)
-{
-  process_output_buffer_list_mutex_lock();
-  struct process_output_buffer * buffer = process_output_buffer_get_active_by_channel_pid(channel, pid);
-  if (buffer == NULL)
-    {
-      process_output_buffer_list_mutex_unlock();
-      return 0;
-    }
-
-  int buffer_size = 0;
-  bool larger_than_buffer = buffer->buffer_size > nbyte;
-  if (larger_than_buffer)
-    {
-      memcpy(buf, (char *)buffer->buffer, nbyte);
-      const int newSize = buffer->buffer_size - nbyte;
-      memcpy((char *)buffer->buffer, (char *)buffer->buffer + nbyte, newSize);
-      buffer->buffer_size = newSize;
-      buffer_size = nbyte;
-    }
-  else if (buffer->buffer_size > 0)
-    {
-      buffer_size = buffer->buffer_size;
-      memcpy(buf, (char *)buffer->buffer, buffer->buffer_size);
-      buffer->buffer_size = 0;
-    }
-
-
-  const bool completed = buffer->completed;
-  const int fd = buffer->fd;
-
-
-  if (buffer_size == 0)
-    {
-      if (completed)
-	{
-	  buffer->released = true;
-	  FD_CLR(fd, &process_output_consumer_tracked_fds);
-	  process_output_consumer_write_ready_notification_fd();
-	  process_output_buffer_consumer_clear_ready_fd(buffer);
-	}
-      else
-	{
-	  buffer->error = 0;
-	}
-      process_output_buffer_consumer_clear_ready_fd(buffer);
-    }
-  else
-    {
-      process_output_consumer_write_ready_notification_fd();
-    }
-  const int saved_errno = buffer->error;
-
-
-  process_output_buffer_list_mutex_unlock();
-
-  if (buffer_size == 0)
-    {
-      if (completed && (saved_errno == 0 || saved_errno == EAGAIN))
-	{
-	  return 0;
-	}
-      if (saved_errno == 0)
-	{
-	  errno = EAGAIN;
-	}
-      else
-	{
-	  errno = saved_errno;
-	}
-      return -1;
-    }
-  return buffer_size;
-}
-
-/*
- * Adds the fd to be tracked by the process output producer thread.
- * This is meant to be called by the consumer thread in order to let the output producer thread
- * know about any new fds that need to be consumed.
- */
-static void
-process_output_consumer_track_fd(int channel, int pid, int fd, bool start_ignored)
-{
-  if (fd < 0)
-    {
-      printf("Skipping process with negative pid / fd\n");
-      return;
-    }
-  process_output_buffer_list_mutex_lock();
-
-  if (process_output_buffer_get_active_by_channel_pid(channel, pid) != NULL)
-    {
-      process_output_buffer_list_mutex_unlock();
-      return;
-    }
-
-  struct process_output_buffer * buffer = xmalloc(sizeof(struct process_output_buffer));
-  buffer->pid = pid;
-  buffer->fd = fd;
-  buffer->error = 0;
-  buffer->buffer_size = 0;
-  buffer->channel = channel;
-  buffer->completed = false;
-  buffer->released = false;
-  buffer->ignored = start_ignored;
-  buffer->prev = NULL;
-
-  buffer->next = process_output_buffer_list;
-  bool first_buffer = process_output_buffer_list == NULL;
-  if (!first_buffer)
-    {
-      process_output_buffer_list->prev = buffer;
-    }
-
-  process_output_buffer_list = buffer;
-  process_output_consumer_write_ready_notification_fd();
-  process_output_buffer_list_mutex_unlock();
-  FD_SET(channel, &process_output_consumer_tracked_fds);
-}
-
-/*
- * Background thread that handles consuming output from fds scheduled by process_output_consumer_track_fd.
+ * Background thread that handles consuming output from fds scheduled by process_output_consumer_fd_track.
  */
 static void *
-process_output_producer_thread(void * args)
+process_output_producer_thread_start(void * args)
 {
   fd_set ready_fds;
   fd_set outputting_fds;
@@ -993,7 +472,7 @@ process_output_producer_thread(void * args)
       process_output_buffer_list_mutex_lock();
       if (FD_ISSET(notify_fd, &ready_fds))
 	{
-	  process_output_consumer_drain_ready_notification_fd();
+	  process_output_consumer_ready_notification_fd_drain();
 	}
 
       struct process_output_buffer * buffer = process_output_buffer_list;
@@ -1025,9 +504,9 @@ process_output_producer_thread(void * args)
 	      else if (!buffer->ignored && (process_output_consumer_waiting_fd == -1 || buffer->fd == process_output_consumer_waiting_fd))
 		{
 		  has_output = true;
-		  process_output_producer_write_notification_fd();
+		  process_output_producer_notification_fd_write();
 
-		  process_output_buffer_producer_set_ready_fd(buffer);
+		  process_output_buffer_producer_ready_fd_set(buffer);
 		}
 	      buffer = next;
 	      continue;
@@ -1053,7 +532,7 @@ process_output_producer_thread(void * args)
 	    {
 	      process_output_buffer_list_mutex_unlock();
 	      FD_SET(fd, &tracked_fds);
-	      updatedSize = read(fd, process_output_producer_copy_buffer, outputSize);
+	      updatedSize = emacs_read(fd, process_output_producer_copy_buffer, outputSize);
 
 	      if (updatedSize > 0)
 		{
@@ -1105,16 +584,16 @@ process_output_producer_thread(void * args)
 		  if (!is_waiting || (is_waiting && buffer->fd == process_output_consumer_waiting_fd))
 		    {
 		      has_output = true;
-		      process_output_producer_write_notification_fd();
+		      process_output_producer_notification_fd_write();
 		    }
-		  process_output_buffer_producer_set_ready_fd(buffer);
+		  process_output_buffer_producer_ready_fd_set(buffer);
 		}
 	    }
 	  buffer = buffer->next;
 	}
       if (!has_output)
 	{
-	  process_output_producer_drain_notification_fd();
+	  process_output_producer_notification_fd_drain();
 	}
 
       process_output_buffer_list_mutex_unlock();
@@ -1127,15 +606,665 @@ process_output_producer_thread(void * args)
   return NULL;
 }
 
+static void
+process_output_ready_fds_mutex_lock(void)
+{
+  int xerrno = errno;
+  sys_mutex_lock(&process_output_ready_fds_mutex);
+  errno = xerrno;
+}
+
+static void
+process_output_ready_fds_mutex_unlock(void)
+{
+  int xerrno = errno;
+  sys_mutex_unlock(&process_output_ready_fds_mutex);
+  errno = xerrno;
+}
+
+static bool
+process_output_producer_notification_p(void)
+{
+  bool value;
+  sys_mutex_lock(&process_output_producer_notification_mutex);
+  value = process_output_producer_has_notification;
+  sys_mutex_unlock(&process_output_producer_notification_mutex);
+  return value;
+}
+
+static void
+process_output_producer_notification_set(bool new_value)
+{
+  sys_mutex_lock(&process_output_producer_notification_mutex);
+  process_output_producer_has_notification = new_value;
+  sys_mutex_unlock(&process_output_producer_notification_mutex);
+}
+
+/*
+ * Called by the consumer to signal to the producer
+ * that the consumer has changed the process_output_buffers list
+ */
+static void
+process_output_consumer_ready_notification_fd_write(void)
+{
+  if (!process_output_consumer_notification_p())
+    {
+      char throwaway[1] = { '\n' };
+      if (emacs_write(process_output_consumer_ready_write_fd, &throwaway, 1) > 0)
+	{
+	  process_output_consumer_notification_set(true);
+	}
+    }
+}
+
+/*
+ * Called by the producer to acknowledge
+ * that the consumer has consumed all of the output available.
+ */
+static int
+process_output_consumer_ready_notification_fd_drain(void)
+{
+  if (!process_output_consumer_notification_p())
+    {
+      return 0;
+    }
+
+  char throwaway[1];
+  int output = emacs_read(process_output_consumer_ready_read_fd, throwaway, 1);
+  if (output == -1)
+    {
+      if (!would_block(errno))
+	{
+	  emacs_perror("Failed to drain ready fd");
+	}
+    }
+
+  process_output_consumer_notification_set(false);
+
+  return output;
+}
+
+
+
+
+
+
+
+/*
+ * Called by producer to signal that there is output
+ * available in the process_output_buffers
+ */
+static void
+process_output_producer_notification_fd_write(void)
+{
+  if (!process_output_producer_notification_p())
+    {
+      char throwaway[1] = { '\n' };
+      if (emacs_write(process_output_producer_ready_write_fd, &throwaway, 1) > 0)
+	{
+	  process_output_producer_notification_set(true);
+	}
+    }
+}
+
+/*
+ * Called by both the producer to signal
+ * there is no more output available in any buffers.
+ */
+static int
+process_output_producer_notification_fd_drain(void)
+{
+  if (!process_output_producer_notification_p())
+    {
+      return 0;
+    }
+
+  char throwaway[1];
+  int output = emacs_read(process_output_producer_ready_read_fd, throwaway, 1);
+  if (output == -1)
+    {
+      if (!would_block(errno))
+	{
+	  emacs_perror("Failed to drain ready fd");
+	}
+    }
+
+  process_output_producer_notification_set(false);
+
+  return output;
+}
+
+static void
+process_output_buffer_list_mutex_lock(void)
+{
+  int xerrno = errno;
+  sys_mutex_lock(&process_output_buffer_list_mutex);
+  errno = xerrno;
+}
+
+static void
+process_output_buffer_list_mutex_unlock(void)
+{
+  int xerrno = errno;
+  sys_mutex_unlock(&process_output_buffer_list_mutex);
+  errno = xerrno;
+}
+
+/*
+ * Assumed to be called where process_output_buffer_list_mutex_lock is claimed
+ */
+static int
+process_output_buffer_list_max_fd(void)
+{
+  int xerrno = errno;
+  struct process_output_buffer * buffer = process_output_buffer_list;
+  int max_fd = -1;
+  while (buffer != NULL)
+    {
+      if (!buffer->released && buffer->fd > max_fd)
+	{
+	  max_fd = buffer->fd;
+	}
+      buffer = buffer->next;
+    }
+  errno = xerrno;
+  return max_fd;
+}
+
+/*
+ * Copies the fd_set of ready process_output_buffers for use in the main emacs event loop
+ * to indicate which processes are available for consuming output.
+ * Return the count of processes that have output available to consume.
+ */
+static int
+process_output_buffer_list_ready_copy_fd_set(fd_set * destination)
+{
+  process_output_ready_fds_mutex_lock();
+  /* Should be safe because `process_output_consumer_waiting_fd` is only modified on main thread */
+  if (process_output_consumer_waiting_fd > -1)
+    {
+      FD_ZERO(destination);
+      if (FD_ISSET(process_output_consumer_waiting_fd, &process_output_buffers_ready_fds))
+	{
+	  FD_SET(process_output_consumer_waiting_fd, destination);
+	}
+    }
+  else
+    {
+      memcpy(destination, &process_output_buffers_ready_fds, sizeof(fd_set));
+    }
+  int count = process_output_buffers_ready_count;
+  process_output_ready_fds_mutex_unlock();
+  return count;
+}
+
+/*
+ * Called by the producer thread to add fds to process_output_buffers_ready_fds.
+ */
+static void
+process_output_buffer_producer_ready_fd_set(struct process_output_buffer * buffer)
+{
+  int fd = buffer->fd;
+  if (fd < 0)
+    {
+      error("Unexpected fd < 0\n");
+      return;
+    }
+  int xerrno = errno;
+  process_output_ready_fds_mutex_lock();
+  if (!FD_ISSET(fd, &process_output_buffers_ready_fds))
+    {
+      if (fd > process_output_buffers_ready_max_fd)
+	{
+	  process_output_buffers_ready_max_fd = fd;
+	}
+      process_output_buffers_ready_count++;
+      FD_SET(fd, &process_output_buffers_ready_fds);
+    }
+  process_output_ready_fds_mutex_unlock();
+  errno = xerrno;
+}
+
+/*
+ * Removes the ready fd from ready_fds for the given buffer. This is called by the consumer
+ * to indicate that it has consumed all of the output from the given buffer.
+ *Assumed to be called where process_output_buffer_list_mutex_lock is claimed.
+ */
+static void
+process_output_buffer_consumer_ready_fd_clear(struct process_output_buffer * buffer)
+{
+  int fd = buffer->fd;
+  int xerrno = errno;
+  if (fd < 0)
+    {
+      error("Unexpected fd < 0\n");
+      return;
+    }
+  process_output_buffers_ready_max_fd = process_output_buffer_list_max_fd();
+  process_output_ready_fds_mutex_lock();
+  if (FD_ISSET(fd, &process_output_buffers_ready_fds))
+    {
+      process_output_buffers_ready_count--;
+      FD_CLR(fd, &process_output_buffers_ready_fds);
+    }
+  process_output_ready_fds_mutex_unlock();
+  errno = xerrno;
+}
+
+/*
+ * Looks up the buffer corresponding to the channel pid tuple, and copies over
+ * maximum tbyte into buf.
+ *
+ * Designed to behave similarly to read.
+ *
+ * Returns the actual size of the buffer written.
+ *
+ */
+static ptrdiff_t
+process_output_consumer_read(int channel, int pid, void * buf, ptrdiff_t nbyte)
+{
+  process_output_buffer_list_mutex_lock();
+  struct process_output_buffer * buffer = process_output_buffer_list_get(channel, pid);
+  if (buffer == NULL)
+    {
+      process_output_buffer_list_mutex_unlock();
+      return 0;
+    }
+
+  int buffer_size = 0;
+  bool larger_than_buffer = buffer->buffer_size > nbyte;
+  if (larger_than_buffer)
+    {
+      memcpy(buf, (char *)buffer->buffer, nbyte);
+      const int newSize = buffer->buffer_size - nbyte;
+      memcpy((char *)buffer->buffer, (char *)buffer->buffer + nbyte, newSize);
+      buffer->buffer_size = newSize;
+      buffer_size = nbyte;
+    }
+  else if (buffer->buffer_size > 0)
+    {
+      buffer_size = buffer->buffer_size;
+      memcpy(buf, (char *)buffer->buffer, buffer->buffer_size);
+      buffer->buffer_size = 0;
+    }
+
+
+  const bool completed = buffer->completed;
+  const int fd = buffer->fd;
+
+
+  if (buffer_size == 0)
+    {
+      if (completed)
+	{
+	  buffer->released = true;
+	  FD_CLR(fd, &process_output_consumer_tracked_fds);
+	  process_output_consumer_ready_notification_fd_write();
+	  process_output_buffer_consumer_ready_fd_clear(buffer);
+	}
+      else
+	{
+	  buffer->error = 0;
+	}
+      process_output_buffer_consumer_ready_fd_clear(buffer);
+    }
+  else
+    {
+      process_output_consumer_ready_notification_fd_write();
+    }
+  const int saved_errno = buffer->error;
+
+
+  process_output_buffer_list_mutex_unlock();
+
+  if (buffer_size == 0)
+    {
+      if (completed && (saved_errno == 0 || saved_errno == EAGAIN))
+	{
+	  return 0;
+	}
+      if (saved_errno == 0)
+	{
+	  errno = EAGAIN;
+	}
+      else
+	{
+	  errno = saved_errno;
+	}
+      return -1;
+    }
+  return buffer_size;
+}
+
+static bool
+process_output_consumer_notification_p(void)
+{
+  bool value;
+  sys_mutex_lock(&process_output_consumer_notification_mutex);
+  value = process_output_consumer_ready_has_notification;
+  sys_mutex_unlock(&process_output_consumer_notification_mutex);
+  return value;
+}
+
+static void
+process_output_consumer_notification_set(bool new_value)
+{
+  sys_mutex_lock(&process_output_consumer_notification_mutex);
+  process_output_consumer_ready_has_notification = new_value;
+  sys_mutex_unlock(&process_output_consumer_notification_mutex);
+}
+
+/**
+ * Handles committing the changes produced by the signal handler. Should only be called by the main emacs event loop.
+ */
+static void
+process_output_consumer_child_signal_fds_transfer_ignore(void)
+{
+  eassert(process_output_child_signal_ignored_fds_count < PROCESS_OUTPUT_MAX_IGNORED_FDS);
+  process_output_buffer_list_mutex_lock();
+  bool isUpdated = false;
+  for (int i = 0; i < process_output_child_signal_ignored_fds_count; i++) {
+    if (process_output_child_signal_ignored_fds[i].fd != -1) {
+      int channel = process_output_child_signal_ignored_fds[i].fd;
+      int pid = process_output_child_signal_ignored_fds[i].pid;
+      struct process_output_buffer * buffer = process_output_buffer_list_get(channel, pid);
+      if (buffer != NULL)
+	{
+	  buffer->ignored = true;
+	  isUpdated = true;
+	  process_output_buffer_consumer_ready_fd_clear(buffer);
+	}
+      process_output_child_signal_ignored_fds[i].fd = -1;
+      process_output_child_signal_ignored_fds[i].pid = -1;
+    }
+  }
+  if (isUpdated) {
+    process_output_consumer_ready_notification_fd_write();
+    process_tick++;
+  }
+  process_output_child_signal_ignored_fds_count = 0;
+  process_output_buffer_list_mutex_unlock();
+}
+
+/*
+ * Adds the fd to a list to be later ignored by process_output_consumer_child_signal_fds_transfer_ignore
+ */
+void
+process_output_consumer_child_signal_fds_ignore(int fd, int pid)
+{
+  eassert(process_output_child_signal_ignored_fds_count < PROCESS_OUTPUT_MAX_IGNORED_FDS);
+  process_output_child_signal_ignored_fds[process_output_child_signal_ignored_fds_count].pid = pid;
+  process_output_child_signal_ignored_fds[process_output_child_signal_ignored_fds_count].fd = fd;
+  process_output_child_signal_ignored_fds_count++;
+}
+
+static void
+process_output_consumer_fd_wait(int fd)
+{
+  process_output_buffer_list_mutex_lock();
+
+  process_output_consumer_waiting_fd = fd;
+  process_output_consumer_ready_notification_fd_write();
+
+  process_output_buffer_list_mutex_unlock();
+}
+
+static void
+process_output_consumer_fd_wait_cancel(void)
+{
+  process_output_buffer_list_mutex_lock();
+
+  const bool waiting = process_output_consumer_waiting_fd > -1;
+    if (waiting)
+      {
+	process_output_consumer_waiting_fd = -1;
+	process_output_consumer_ready_notification_fd_write();
+      }
+
+  process_output_buffer_list_mutex_unlock();
+}
+
+/*
+ * Adds the fd to be tracked by the process output producer thread.
+ * This is meant to be called by the consumer thread in order to let the output producer thread
+ * know about any new fds that need to be consumed.
+ */
+static void
+process_output_consumer_fd_track(int channel, int pid, int fd, bool start_ignored)
+{
+  if (fd < 0)
+    {
+      printf("Skipping process with negative pid / fd\n");
+      return;
+    }
+  process_output_buffer_list_mutex_lock();
+
+  if (process_output_buffer_list_get(channel, pid) != NULL)
+    {
+      process_output_buffer_list_mutex_unlock();
+      return;
+    }
+
+  struct process_output_buffer * buffer = xmalloc(sizeof(struct process_output_buffer));
+  buffer->pid = pid;
+  buffer->fd = fd;
+  buffer->error = 0;
+  buffer->buffer_size = 0;
+  buffer->channel = channel;
+  buffer->completed = false;
+  buffer->released = false;
+  buffer->ignored = start_ignored;
+  buffer->prev = NULL;
+
+  buffer->next = process_output_buffer_list;
+  bool first_buffer = process_output_buffer_list == NULL;
+  if (!first_buffer)
+    {
+      process_output_buffer_list->prev = buffer;
+    }
+
+  process_output_buffer_list = buffer;
+  process_output_consumer_ready_notification_fd_write();
+  process_output_buffer_list_mutex_unlock();
+  FD_SET(channel, &process_output_consumer_tracked_fds);
+}
+
+/*
+ * Should only be called from the main thread.
+ */
+static bool
+process_output_consumer_fd_tracked_p(int channel)
+{
+  return channel >= 0 && FD_ISSET(channel, &process_output_consumer_tracked_fds);
+}
+
+/*
+ * Called by the main thread to let the output producer thread know that a channel pid pair
+ * is no longer going to be used.
+ */
+static void
+process_output_consumer_fd_deactivate(int channel, int pid)
+{
+  process_output_buffer_list_mutex_lock();
+  struct process_output_buffer * buffer = process_output_buffer_list_get(channel, pid);
+  if (buffer != NULL)
+    {
+      buffer->released = true;
+      FD_CLR(channel, &process_output_consumer_tracked_fds);
+      process_output_buffer_consumer_ready_fd_clear(buffer);
+    }
+  process_output_buffer_list_mutex_unlock();
+}
+
+
+static void
+process_output_consumer_fd_ignore(int channel, int pid)
+{
+  if (!process_output_consumer_fd_tracked_p(channel))
+    {
+      return;
+    }
+  process_output_buffer_list_mutex_lock();
+  struct process_output_buffer * buffer = process_output_buffer_list_get(channel, pid);
+  if (buffer != NULL)
+    {
+      buffer->ignored = true;
+      process_output_buffer_consumer_ready_fd_clear(buffer);
+      process_output_consumer_ready_notification_fd_write();
+    }
+  process_output_buffer_list_mutex_unlock();
+}
+
+static void
+process_output_consumer_fd_unignore(int channel, int pid)
+{
+  if (!process_output_consumer_fd_tracked_p(channel))
+    {
+      return;
+    }
+  process_output_buffer_list_mutex_lock();
+  struct process_output_buffer * buffer = process_output_buffer_list_get(channel, pid);
+  if (buffer != NULL)
+    {
+      buffer->ignored = false;
+      process_output_consumer_ready_notification_fd_write();
+    }
+  process_output_buffer_list_mutex_unlock();
+}
+
+static ptrdiff_t
+process_write(int init_tick, int fd, void const * write_buffer, ptrdiff_t size)
+{
+  int written_size = 0;
+  process_write_buffer_list_mutex_lock();
+  struct process_write_buffer * buffer = process_write_buffer_list;
+  while (buffer != NULL && (buffer->released || buffer->fd != fd || buffer->init_tick != init_tick))
+    {
+      buffer = buffer->next;
+    }
+  if (buffer == NULL)
+    {
+      buffer = xmalloc(sizeof(struct process_write_buffer));
+      buffer->buffer_size = 0;
+      buffer->next = process_write_buffer_list;
+      if (process_write_buffer_list != NULL)
+	{
+	  process_write_buffer_list->prev = buffer;
+	}
+      process_write_buffer_list = buffer;
+      buffer->prev = NULL;
+      buffer->released = false;
+      buffer->init_tick = init_tick;
+      buffer->fd = fd;
+    }
+
+  process_write_ready_fd_write();
+  if (size > PROCESS_OUTPUT_MAX - buffer->buffer_size)
+    {
+      written_size = PROCESS_OUTPUT_MAX - buffer->buffer_size;
+    }
+  else
+    {
+      written_size = size;
+    }
+  memcpy(buffer->buffer + buffer->buffer_size, write_buffer, written_size);
+  buffer->buffer_size += written_size;
+
+  process_write_buffer_list_mutex_unlock();
+  return written_size;
+}
+
+static void
+process_write_buffer_list_mutex_lock(void)
+{
+  int xerrno = errno;
+  sys_mutex_lock(&process_write_buffer_list_mutex);
+  errno = xerrno;
+}
+
+static void
+process_write_buffer_list_mutex_unlock(void)
+{
+  int xerrno = errno;
+  sys_mutex_unlock(&process_write_buffer_list_mutex);
+  errno = xerrno;
+}
+
+static void
+process_write_ready_fd_write(void)
+{
+  char throwaway[1] = { '\n' };
+  // Does not matter if this succeeds or happens multiple times, since it just needs to wake up the writer thread
+  // and will converge correctly
+  emacs_write(process_writer_ready_write_fd, &throwaway, 1);
+}
+
+static void
+process_write_ready_fd_drain(void)
+{
+  char throwaway[1];
+  emacs_read(process_writer_ready_read_fd, &throwaway, 1);
+}
+
+static void
+process_write_complete_fd_write(void)
+{
+  char throwaway[1] = { '\n' };
+  // Does not matter if this succeeds or happens multiple times, since it just needs to wake up the writer thread
+  // and will converge correctly
+  emacs_write(process_writer_complete_write_fd, &throwaway, 1);
+}
+
+static void
+process_write_complete_fd_drain(void)
+{
+  char throwaway[1];
+  emacs_read(process_writer_complete_read_fd, &throwaway, 1);
+}
+
+static bool
+process_write_output_flushed_p(int init_tick, int fd)
+{
+  process_write_buffer_list_mutex_lock();
+  struct process_write_buffer * buffer = process_write_buffer_list;
+  while (buffer != NULL && (buffer->released || buffer->fd != fd))
+    {
+      buffer = buffer->next;
+    }
+  bool flushed_p = true;
+  if (buffer != NULL)
+    {
+      flushed_p = buffer->buffer_size == 0;
+
+    }
+  process_write_buffer_list_mutex_unlock();
+  return flushed_p;
+}
+
+static void
+process_write_buffer_release(int init_tick, int fd)
+{
+  process_write_buffer_list_mutex_lock();
+  struct process_write_buffer * buffer = process_write_buffer_list;
+  while (buffer != NULL && (buffer->released || buffer->init_tick  != init_tick || buffer->fd != fd))
+    {
+      buffer = buffer->next;
+    }
+  if (buffer != NULL)
+    {
+      buffer->released = true;
+    }
+  process_write_buffer_list_mutex_unlock();
+}
+
 static void *
-process_writer_thread(void * args)
+process_write_thread_start(void * args)
 {
   struct timespec no_timeout = make_timespec(0, 0);
 
   fd_set fds;
   fd_set notify_fds;
   FD_ZERO(&fds);
-
 
   process_write_buffer_list_mutex_lock();
   while (1)
@@ -1168,7 +1297,7 @@ process_writer_thread(void * args)
 	  // When the notify fd is set, try writing to every buffer since it won't be set in fds
 	  notified = true;
 
-	  process_writer_drain_ready_fd();
+	  process_write_ready_fd_drain();
 	}
 
       ptr = process_write_buffer_list;
@@ -1204,12 +1333,12 @@ process_writer_thread(void * args)
                 {
                   batch_size = ptr->buffer_size;
                 }
-              memcpy(process_writer_thread__copy_buffer, ptr->buffer, batch_size);
+              memcpy(process_write_thread__copy_buffer, ptr->buffer, batch_size);
 
               process_write_buffer_list_mutex_unlock();
 
               int flags = FWRITE;
-              int written_count = write (fd, process_writer_thread__copy_buffer, batch_size);
+              int written_count = write (fd, process_write_thread__copy_buffer, batch_size);
               char throwaway = '\n';
               if (written_count < 0 && errno == EAGAIN)
                 {
@@ -1249,151 +1378,30 @@ process_writer_thread(void * args)
 
       if (!write_remaining)
 	{
-	  process_writer_write_complete_fd();
+	  process_write_complete_fd_write();
 	}
     }
   return NULL;
 }
 
-static void
-process_write_buffer_release(int init_tick, int fd)
+/*
+ * Lookup active process output buffer by channel pid tuple.
+ * Expected to be called while process_output_buffer_list_mutex_lock() is held.
+ */
+static struct process_output_buffer *
+process_output_buffer_list_get(int channel, int pid)
 {
-  process_write_buffer_list_mutex_lock();
-  struct process_write_buffer * buffer = process_write_buffer_list;
-  while (buffer != NULL && (buffer->released || buffer->init_tick  != init_tick || buffer->fd != fd))
+  struct process_output_buffer * buffer = process_output_buffer_list;
+  while (buffer != NULL)
     {
-      buffer = buffer->next;
-    }
-  if (buffer != NULL)
-    {
-      buffer->released = true;
-    }
-  process_write_buffer_list_mutex_unlock();
-}
-
-static bool
-process_write_output_flushed_p(int init_tick, int fd)
-{
-  process_write_buffer_list_mutex_lock();
-  struct process_write_buffer * buffer = process_write_buffer_list;
-  while (buffer != NULL && (buffer->released || buffer->fd != fd))
-    {
-      buffer = buffer->next;
-    }
-  bool flushed_p = true;
-  if (buffer != NULL)
-    {
-      flushed_p = buffer->buffer_size == 0;
-
-    }
-  process_write_buffer_list_mutex_unlock();
-  return flushed_p;
-}
-
-static ptrdiff_t
-process_write(int init_tick, int fd, void const * write_buffer, ptrdiff_t size)
-{
-  int written_size = 0;
-  process_write_buffer_list_mutex_lock();
-  struct process_write_buffer * buffer = process_write_buffer_list;
-  while (buffer != NULL && (buffer->released || buffer->fd != fd || buffer->init_tick != init_tick))
-    {
-      buffer = buffer->next;
-    }
-  if (buffer == NULL)
-    {
-      buffer = xmalloc(sizeof(struct process_write_buffer));
-      buffer->buffer_size = 0;
-      buffer->next = process_write_buffer_list;
-      if (process_write_buffer_list != NULL)
+      if (buffer->channel == channel && buffer->pid == pid && !buffer->released)
 	{
-	  process_write_buffer_list->prev = buffer;
+	  return buffer;
 	}
-      process_write_buffer_list = buffer;
-      buffer->prev = NULL;
-      buffer->released = false;
-      buffer->init_tick = init_tick;
-      buffer->fd = fd;
+      buffer = buffer->next;
     }
-
-  process_writer_write_ready_fd();
-  if (size > PROCESS_OUTPUT_MAX - buffer->buffer_size)
-    {
-      written_size = PROCESS_OUTPUT_MAX - buffer->buffer_size;
-    }
-  else
-    {
-      written_size = size;
-    }
-  memcpy(buffer->buffer + buffer->buffer_size, write_buffer, written_size);
-  buffer->buffer_size += written_size;
-
-  process_write_buffer_list_mutex_unlock();
-  return written_size;
+  return NULL;
 }
-
-
-/*
- * Called by the main thread to let the output producer thread know that a channel pid pair
- * is no longer going to be used.
- */
-static void
-process_output_consumer_deactivate_fd(int channel, int pid)
-{
-  process_output_buffer_list_mutex_lock();
-  struct process_output_buffer * buffer = process_output_buffer_get_active_by_channel_pid(channel, pid);
-  if (buffer != NULL)
-    {
-      buffer->released = true;
-      FD_CLR(channel, &process_output_consumer_tracked_fds);
-      process_output_buffer_consumer_clear_ready_fd(buffer);
-    }
-  process_output_buffer_list_mutex_unlock();
-}
-
-/*
- * Should only be called from the main thread.
- */
-static bool
-process_output_consumer_fd_tracked_p(int channel)
-{
-  return channel >= 0 && FD_ISSET(channel, &process_output_consumer_tracked_fds);
-}
-
-static void
-process_output_consumer_ignore_fd(int channel, int pid)
-{
-  if (!process_output_consumer_fd_tracked_p(channel))
-    {
-      return;
-    }
-  process_output_buffer_list_mutex_lock();
-  struct process_output_buffer * buffer = process_output_buffer_get_active_by_channel_pid(channel, pid);
-  if (buffer != NULL)
-    {
-      buffer->ignored = true;
-      process_output_buffer_consumer_clear_ready_fd(buffer);
-      process_output_consumer_write_ready_notification_fd();
-    }
-  process_output_buffer_list_mutex_unlock();
-}
-static void
-process_output_consumer_unignore_fd(int channel, int pid)
-{
-  if (!process_output_consumer_fd_tracked_p(channel))
-    {
-      return;
-    }
-  process_output_buffer_list_mutex_lock();
-  struct process_output_buffer * buffer = process_output_buffer_get_active_by_channel_pid(channel, pid);
-  if (buffer != NULL)
-    {
-      buffer->ignored = false;
-      process_output_consumer_write_ready_notification_fd();
-    }
-  process_output_buffer_list_mutex_unlock();
-}
-
 
 /*
  * Handles initializing the process_output_producer thread, and all of the necessary mutexes and file descriptors
@@ -1494,18 +1502,17 @@ process_output_producer_thread_init(void)
 
   pthread_t process_buffer_thread;
 
-  if (pthread_create(&process_buffer_thread, NULL, &process_output_producer_thread, NULL) != 0)
+  if (pthread_create(&process_buffer_thread, NULL, &process_output_producer_thread_start, NULL) != 0)
     {
       emacs_perror("Failed to create process output consumer");
     }
-  pthread_t process_write_thread;
+  pthread_t process_write_thread_ref;
 
-  if (pthread_create(&process_write_thread, NULL, &process_writer_thread, NULL) != 0)
+  if (pthread_create(&process_write_thread_ref, NULL, &process_write_thread_start, NULL) != 0)
     {
       emacs_perror("Failed to create process write thread");
     }
 }
-
 
 /* Number of bits set in connect_wait_mask.  */
 static int num_pending_connects;
@@ -2358,7 +2365,7 @@ Interactively, it will kill the current buffer's process.  */)
       if (p->alive)
 	record_kill_process (p, Qnil);
 
-      process_output_consumer_deactivate_fd(p->infd, p->pid);
+      process_output_consumer_fd_deactivate(p->infd, p->pid);
 
       if (p->infd >= 0)
 	{
@@ -2563,14 +2570,14 @@ set_process_filter_masks (struct Lisp_Process *p)
   if (EQ (p->filter, Qt) && !EQ (p->status, Qlisten))
     {
       delete_read_fd (p->infd);
-      process_output_consumer_ignore_fd(p->infd, p->pid);
+      process_output_consumer_fd_ignore(p->infd, p->pid);
     }
   else if (EQ (p->filter, Qt)
     /* Network or serial process not stopped:  */
     && !EQ (p->command, Qt))
     {
       add_process_read_fd (p->infd);
-      process_output_consumer_unignore_fd(p->infd, p->pid);
+      process_output_consumer_fd_unignore(p->infd, p->pid);
     }
 }
 
@@ -2622,7 +2629,7 @@ The string argument is normally a multibyte string, except:
       if (EQ (filter, Qt) && !EQ (p->status, Qlisten))
 	{
 	  delete_read_fd (p->infd);
-	  process_output_consumer_ignore_fd(p->infd, p->pid);
+	  process_output_consumer_fd_ignore(p->infd, p->pid);
 	}
       else if (/* If filter WAS t, then resume reading output.  */
 	       EQ (p->filter, Qt)
@@ -2630,7 +2637,7 @@ The string argument is normally a multibyte string, except:
 	       && !EQ (p->command, Qt))
 	{
 	  add_process_read_fd (p->infd);
-	  process_output_consumer_unignore_fd(p->infd, p->pid);
+	  process_output_consumer_fd_unignore(p->infd, p->pid);
 	}
     }
 
@@ -3550,7 +3557,7 @@ create_process (Lisp_Object process, char **new_argv, Lisp_Object current_dir)
 	  struct Lisp_Process *pp = XPROCESS (p->stderrproc);
 	  close_process_fd (&pp->open_fd[SUBPROCESS_STDOUT]);
 	}
-      process_output_consumer_track_fd(p->infd, p->pid, p->infd, EQ (p->command, Qt) || EQ (p->filter, Qt));
+      process_output_consumer_fd_track(p->infd, p->pid, p->infd, EQ (p->command, Qt) || EQ (p->filter, Qt));
     }
 }
 
@@ -3605,7 +3612,7 @@ create_pty (Lisp_Object process)
 
       if (!EQ (p->filter, Qt))
 	add_process_read_fd (pty_fd);
-      process_output_consumer_track_fd(p->infd, p->pid, p->infd, false);
+      process_output_consumer_fd_track(p->infd, p->pid, p->infd, false);
 
       pset_tty_name (p, build_string (pty_name));
     }
@@ -3711,7 +3718,7 @@ usage:  (make-pipe-process &rest ARGS)  */)
     pset_command (p, Qt);
   eassert (! p->pty_in && ! p->pty_out);
 
-  process_output_consumer_track_fd(p->infd, p->pid, p->infd, EQ (p->command, Qt));
+  process_output_consumer_fd_track(p->infd, p->pid, p->infd, EQ (p->command, Qt));
 
   if (!EQ (p->command, Qt)
       && !EQ (p->filter, Qt))
@@ -4450,7 +4457,7 @@ usage:  (make-serial-process &rest ARGS)  */)
   if (tem = plist_get (contact, QCstop), !NILP (tem))
     pset_command (p, Qt);
   eassert (! p->pty_in && ! p->pty_out);
-  process_output_consumer_track_fd(p->infd, p->pid, p->infd, EQ (p->command, Qt) || EQ (p->filter, Qt));
+  process_output_consumer_fd_track(p->infd, p->pid, p->infd, EQ (p->command, Qt) || EQ (p->filter, Qt));
 
   if (!EQ (p->command, Qt)
     && !EQ (p->filter, Qt))
@@ -6051,7 +6058,7 @@ deactivate_process (Lisp_Object proc)
   if (inchannel >= 0)
     {
       // Just in case it wasn't cleaned up elsewhere
-      process_output_consumer_deactivate_fd(inchannel, p->pid);
+      process_output_consumer_fd_deactivate(inchannel, p->pid);
       p->infd  = -1;
       p->outfd = -1;
 #ifdef DATAGRAM_SOCKETS
@@ -6336,7 +6343,7 @@ server_accept_connection (Lisp_Object server, int channel)
     }
   else
     {
-      process_output_consumer_ignore_fd(p->infd, p->pid);
+      process_output_consumer_fd_ignore(p->infd, p->pid);
     }
 
   if (s > max_desc)
@@ -6724,11 +6731,11 @@ wait_reading_process_output (intmax_t time_limit, int nsecs, int read_kbd,
 	  timeout = make_timespec (0, 0);
 	  if (wait_proc == NULL)
 	    {
-	      process_output_consumer_wait_for_fd_cancel();
+	      process_output_consumer_fd_wait_cancel();
 	    }
 	  else
 	    {
-	      process_output_consumer_wait_for_fd(wait_proc->infd);
+	      process_output_consumer_fd_wait(wait_proc->infd);
 	    }
 
 	  if ((thread_select (pselect, merged_max_desc + 1,
@@ -6743,7 +6750,7 @@ wait_reading_process_output (intmax_t time_limit, int nsecs, int read_kbd,
 	      got_some_output = status_notify (NULL, wait_proc);
 	      if (do_display) redisplay_preserve_echo_area (13);
 	    }
-	  process_output_consumer_child_signal_transfer_fds();
+	  process_output_consumer_child_signal_fds_transfer_ignore();
 	}
 
       /* Don't wait for output from a non-running process.  Just
@@ -6763,7 +6770,7 @@ wait_reading_process_output (intmax_t time_limit, int nsecs, int read_kbd,
 	    {
 	      unsigned int count = 0;
 	      XSETPROCESS (proc, wait_proc);
-	      process_output_consumer_wait_for_fd(wait_proc->infd);
+	      process_output_consumer_fd_wait(wait_proc->infd);
 	      while (true)
 		{
 		  int nread = read_process_output (proc, wait_proc->infd);
@@ -7017,14 +7024,14 @@ wait_reading_process_output (intmax_t time_limit, int nsecs, int read_kbd,
 				NULL, &timeout, NULL);
 #endif	/* !HAVE_GLIB */
 
-	  process_output_consumer_child_signal_transfer_fds();
+	  process_output_consumer_child_signal_fds_transfer_ignore();
 
 	  if (FD_ISSET(process_writer_complete_read_fd, &Available))
 	    {
-	      process_writer_drain_complete_fd();
+	      process_write_complete_fd_drain();
 	    }
 	  FD_ZERO(&process_ready);
-	  int ready_count = process_output_buffers_ready_copy_fd_set(&process_ready);
+	  int ready_count = process_output_buffer_list_ready_copy_fd_set(&process_ready);
 
 	  if (ready_count > nfds)
 	    {
@@ -7259,7 +7266,7 @@ wait_reading_process_output (intmax_t time_limit, int nsecs, int read_kbd,
 		  /* Clear the descriptor now, so we only raise the
 		     signal once.  */
 		  delete_read_fd (channel);
-		  process_output_consumer_ignore_fd(channel, p->pid);
+		  process_output_consumer_fd_ignore(channel, p->pid);
 
 		  if (p->pid == -2)
 		    {
@@ -7373,7 +7380,7 @@ wait_reading_process_output (intmax_t time_limit, int nsecs, int read_kbd,
 		      && !EQ (p->command, Qt))
 		    {
 		      add_process_read_fd (p->infd);
-		      process_output_consumer_unignore_fd(p->infd, p->pid);
+		      process_output_consumer_fd_unignore(p->infd, p->pid);
 		    }
 		}
 	    }
@@ -7995,7 +8002,7 @@ send_process (Lisp_Object proc, const char *buf, ptrdiff_t len,
 		  }
 		else
 		  {
-		    process_output_consumer_ignore_fd(p->outfd, p->pid);
+		    process_output_consumer_fd_ignore(p->outfd, p->pid);
 		    written = process_write (p->init_tick, outfd, cur_buf, cur_len);
 		  }
 	      rv = (written ? 0 : -1);
@@ -8073,7 +8080,7 @@ send_process (Lisp_Object proc, const char *buf, ptrdiff_t len,
 		}
 	      // TODO: Stop spinning and use a pselect
 	    }
-	  process_output_consumer_unignore_fd(p->outfd, p->pid);
+	  process_output_consumer_fd_unignore(p->outfd, p->pid);
 	  cur_buf += written;
 	  cur_len -= written;
 	}
@@ -8426,7 +8433,7 @@ of incoming traffic.  */)
 #endif
   if (p != NULL && p->infd >= 0 && !p->is_non_blocking_client && !p->is_server)
     {
-      process_output_consumer_ignore_fd(p->infd, p->pid);
+      process_output_consumer_fd_ignore(p->infd, p->pid);
     }
 
   return process;
@@ -8464,7 +8471,7 @@ traffic.  */)
 #endif /* not WINDOWSNT */
 	}
 
-      process_output_consumer_unignore_fd(p->infd, p->pid);
+      process_output_consumer_fd_unignore(p->infd, p->pid);
 
       pset_command (p, Qnil);
       return process;
@@ -8477,7 +8484,7 @@ traffic.  */)
 
     if (p != NULL)
       {
-	process_output_consumer_unignore_fd(p->infd, p->pid);
+	process_output_consumer_fd_unignore(p->infd, p->pid);
       }
   return process;
 }
@@ -8877,7 +8884,7 @@ handle_child_signal (int sig)
 	      /* clear_desc_flag avoids a compiler bug in Microsoft C.  */
 	      if (clear_desc_flag)
 		{
-		  process_output_consumer_child_signal_ignore_fd(p->infd, p->pid);
+		  process_output_consumer_child_signal_fds_ignore(p->infd, p->pid);
 		  delete_read_fd (p->infd);
 		}
 	    }
@@ -9007,11 +9014,11 @@ status_notify (struct Lisp_Process *deleting_process,
   update_tick = process_tick;
   if (wait_proc == NULL)
     {
-      process_output_consumer_wait_for_fd_cancel();
+      process_output_consumer_fd_wait_cancel();
     }
   else
     {
-      process_output_consumer_wait_for_fd(wait_proc->infd);
+      process_output_consumer_fd_wait(wait_proc->infd);
     }
 
   FOR_EACH_PROCESS (tail, proc)
