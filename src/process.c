@@ -684,12 +684,6 @@ process_output_consumer_ready_notification_fd_drain(void)
   return output;
 }
 
-
-
-
-
-
-
 /*
  * Called by producer to signal that there is output
  * available in the process_output_buffers
@@ -8070,7 +8064,7 @@ send_process (Lisp_Object proc, const char *buf, ptrdiff_t len,
 	  while (!NETCONN1_P(p) && process_output_consumer_fd_tracked_p(p->infd) && !process_write_output_flushed_p(p->init_tick, p->outfd))
 	    {
 	      // There is an expectation that send string does not read output for strings below a certain length
-	      bool read_output = len > 1024;
+	      bool read_output = len >= 512;
 	      //TODO: Switch this to being managed via a fd so that the main loop is interrupted
 	      // when writing is complete
 	      if (read_output)
