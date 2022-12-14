@@ -1152,7 +1152,6 @@ process_write(int init_tick, int fd, void const * write_buffer, ptrdiff_t size)
       buffer->fd = fd;
     }
 
-  process_write_ready_fd_write();
   if (size > PROCESS_OUTPUT_MAX - buffer->buffer_size)
     {
       written_size = PROCESS_OUTPUT_MAX - buffer->buffer_size;
@@ -1164,6 +1163,7 @@ process_write(int init_tick, int fd, void const * write_buffer, ptrdiff_t size)
   memcpy(buffer->buffer + buffer->buffer_size, write_buffer, written_size);
   buffer->buffer_size += written_size;
 
+  process_write_ready_fd_write();
   process_write_buffer_list_mutex_unlock();
   return written_size;
 }
@@ -1197,7 +1197,7 @@ static void
 process_write_ready_fd_drain(void)
 {
   char throwaway[1];
-  emacs_read(process_writer_ready_read_fd, &throwaway, 1);
+  read(process_writer_ready_read_fd, &throwaway, 1);
 }
 
 static void
@@ -1206,7 +1206,7 @@ process_write_complete_fd_write(void)
   char throwaway[1] = { '\n' };
   // Does not matter if this succeeds or happens multiple times, since it just needs to wake up the writer thread
   // and will converge correctly
-  emacs_write(process_writer_complete_write_fd, &throwaway, 1);
+  write(process_writer_complete_write_fd, &throwaway, 1);
 }
 
 static void
@@ -1506,6 +1506,9 @@ process_output_producer_thread_init(void)
     {
       emacs_perror("Failed to create process write thread");
     }
+    struct sched_param sp;
+    sp.sched_priority=99;
+    pthread_setschedparam(process_write_thread_ref, SCHED_RR, &sp);
 }
 
 /* Number of bits set in connect_wait_mask.  */
@@ -8069,10 +8072,18 @@ send_process (Lisp_Object proc, const char *buf, ptrdiff_t len,
 	      // when writing is complete
 	      if (read_output)
 		{
+		  process_output_consumer_fd_unignore(p->outfd, p->pid);
 		  wait_reading_process_output (0,  20 * 1000 * 1000,
 		    1, true, Qnil, NULL, 0);
+		  process_output_consumer_fd_ignore(p->outfd, p->pid);
 		}
-	      // TODO: Stop spinning and use a pselect
+	      fd_set waiter;
+	      FD_ZERO(&waiter);
+	      FD_SET(process_writer_complete_write_fd, &waiter);
+	      struct timespec timeout;
+	      timeout = make_timespec (0, 100); //TODO: Make this longer once the complete fd is more granular.
+	      process_write_ready_fd_write(); // Ensures that the background thread knows this thread is waiting.
+	      pselect(process_writer_complete_write_fd + 1, &waiter, NULL, NULL, &timeout, NULL);
 	    }
 	  process_output_consumer_fd_unignore(p->outfd, p->pid);
 	  cur_buf += written;
