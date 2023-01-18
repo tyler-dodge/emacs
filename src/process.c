@@ -8064,7 +8064,7 @@ send_process (Lisp_Object proc, const char *buf, ptrdiff_t len,
 		/* This is a real error.  */
 		report_file_error ("Writing to process", proc);
 	    }
-	  while (!NETCONN1_P(p) && process_output_consumer_fd_tracked_p(p->infd) && !process_write_output_flushed_p(p->init_tick, p->outfd))
+	  while (!NETCONN1_P(p) && p->alive && process_output_consumer_fd_tracked_p(p->infd) && !process_write_output_flushed_p(p->init_tick, p->outfd))
 	    {
 	      // There is an expectation that send string does not read output for strings below a certain length
 	      bool read_output = len >= 512;
