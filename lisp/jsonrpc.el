@@ -669,10 +669,6 @@ TIMEOUT is nil)."
         (cl-return-from jsonrpc--async-request-1 (list id timer))))
     ;; Really send it
     ;;
-    (jsonrpc-connection-send connection
-                             :id id
-                             :method method
-                             :params params)
     (puthash id
              (list (or success-fn
                        (jsonrpc-lambda (&rest _ignored)
@@ -689,6 +685,10 @@ TIMEOUT is nil)."
                                       :id id :error code))))
                    (setq timer (funcall make-timer)))
              (jsonrpc--request-continuations connection))
+    (jsonrpc-connection-send connection
+                             :id id
+                             :method method
+                             :params params)
     (list id timer)))
 
 (defun jsonrpc--message (format &rest args)
