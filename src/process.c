@@ -454,10 +454,6 @@ static sys_mutex_t process_output_buffer_list_mutex;
 static void *
 process_output_producer_thread_start(void * args)
 {
-  sigset_t signals;
-  sigfillset(&signals);
-  pthread_sigmask(SIG_SETMASK, &signals, NULL);
-
   fd_set ready_fds;
   fd_set outputting_fds;
   fd_set tracked_fds;
@@ -1258,9 +1254,6 @@ process_write_buffer_release(int init_tick, int fd)
 static void *
 process_write_thread_start(void * args)
 {
-  sigset_t signals;
-  sigfillset(&signals);
-  pthread_sigmask(SIG_SETMASK, &signals, NULL);
   struct timespec no_timeout = make_timespec(0, 0);
 
   fd_set fds;
@@ -1503,6 +1496,10 @@ process_output_producer_thread_init(void)
 
   sys_thread_t process_buffer_thread;
 
+  sigset_t saved;
+  sigset_t signals;
+  sigfillset(&signals);
+  pthread_sigmask(SIG_SETMASK, &signals, &saved);
   if (!sys_thread_create(&process_buffer_thread, process_output_producer_thread_start, NULL))
     {
       emacs_perror("Failed to create process output consumer");
@@ -1513,9 +1510,10 @@ process_output_producer_thread_init(void)
     {
       emacs_perror("Failed to create process write thread");
     }
-    struct sched_param sp;
-    sp.sched_priority=99;
-    pthread_setschedparam(process_write_thread_ref, SCHED_RR, &sp);
+  pthread_sigmask(SIG_SETMASK, &saved, NULL);
+  struct sched_param sp;
+  sp.sched_priority=99;
+  pthread_setschedparam(process_write_thread_ref, SCHED_RR, &sp);
 }
 
 /* Number of bits set in connect_wait_mask.  */
