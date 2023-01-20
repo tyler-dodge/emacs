@@ -1302,20 +1302,23 @@ process_write_thread_start(void * args)
           if (ptr->released)
             {
               if (ptr->prev == NULL)
-                {
-                  process_write_buffer_list = ptr->next;
-                }
-              else
-                {
-                  ptr->prev->next = ptr->next;
-                  if (ptr->next != NULL)
-                    {
-                      ptr->next->prev = ptr->prev;
-                    }
-                }
-              void * old_buffer = ptr;
+		{
+		  process_write_buffer_list = ptr->next;
+		  if (ptr->next != NULL)
+		    {
+		      ptr->next->prev = NULL;
+		    }
+		}
+	      else
+		{
+		  ptr->prev->next = ptr->next;
+		  if (ptr->next != NULL)
+		    {
+		      ptr->next->prev = ptr->prev;
+		    }
+		}
+	      void * old_buffer = ptr;
               ptr = ptr->next;
-
               xfree((void *)old_buffer);
               continue;
             }
