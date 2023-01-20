@@ -8081,8 +8081,8 @@ send_process (Lisp_Object proc, const char *buf, ptrdiff_t len,
 	      if (read_output)
 		{
 		  process_output_consumer_fd_unignore(p->outfd, p->pid);
-		  wait_reading_process_output (0, 0,
-		    1, true, Qnil, NULL, 0);
+		  wait_reading_process_output (0, 10 * 1000 * 1000, // 10 ms
+		    0, 0, Qnil, NULL, 0);
 		  process_output_consumer_fd_ignore(p->outfd, p->pid);
 		}
 	      if (p->alive) {
