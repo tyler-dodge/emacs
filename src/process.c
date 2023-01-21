@@ -8007,7 +8007,6 @@ send_process (Lisp_Object proc, const char *buf, ptrdiff_t len,
 		  }
 		else
 		  {
-		    process_output_consumer_fd_ignore(p->outfd, p->pid);
 		    written = process_write (p->init_tick, outfd, cur_buf, cur_len);
 		  }
 	      rv = (written ? 0 : -1);
@@ -8072,30 +8071,16 @@ send_process (Lisp_Object proc, const char *buf, ptrdiff_t len,
 		/* This is a real error.  */
 		report_file_error ("Writing to process", proc);
 	    }
-	  while (!NETCONN1_P(p) && p->alive && process_output_consumer_fd_tracked_p(p->infd) && !process_write_output_flushed_p(p->init_tick, p->outfd))
+	  if (!NETCONN1_P(p) && p->alive && process_output_consumer_fd_tracked_p(p->infd))
 	    {
-	      // There is an expectation that send string does not read output for strings below a certain length
-	      bool read_output = len >= 512;
-	      //TODO: Switch this to being managed via a fd so that the main loop is interrupted
-	      // when writing is complete
-	      if (read_output)
-		{
-		  process_output_consumer_fd_unignore(p->outfd, p->pid);
-		  wait_reading_process_output (0, 10 * 1000 * 1000, // 10 ms
-		    0, 0, Qnil, NULL, 0);
-		  process_output_consumer_fd_ignore(p->outfd, p->pid);
-		}
-	      if (p->alive) {
-		fd_set waiter;
-		FD_ZERO(&waiter);
-		FD_SET(process_writer_complete_write_fd, &waiter);
-		struct timespec timeout;
-		timeout = make_timespec (0, 100); //TODO: Make this longer once the complete fd is more granular.
-		process_write_ready_fd_write(); // Ensures that the background thread knows this thread is waiting.
-		pselect(process_writer_complete_write_fd + 1, &waiter, NULL, NULL, &timeout, NULL);
-	      }
+	      fd_set waiter;
+	      FD_ZERO(&waiter);
+	      FD_SET(process_writer_complete_write_fd, &waiter);
+	      struct timespec timeout;
+	      timeout = make_timespec (0, 100); //TODO: Make this longer once the complete fd is more granular.
+	      process_write_ready_fd_write(); // Ensures that the background thread knows this thread is waiting.
+	      pselect(process_writer_complete_write_fd + 1, &waiter, NULL, NULL, &timeout, NULL);
 	    }
-	  process_output_consumer_fd_unignore(p->outfd, p->pid);
 	  cur_buf += written;
 	  cur_len -= written;
 	}
