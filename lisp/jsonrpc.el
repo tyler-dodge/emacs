@@ -710,44 +710,48 @@ TIMEOUT is nil)."
                      (apply #'format format args)
                      :warning)))
 
+(defcustom jsonrpc-disable-logs t
+  "JSONRPC logs can be expensive because it attempts to pretty print the output.")
+
 (defun jsonrpc--log-event (connection message &optional type)
   "Log a JSONRPC-related event.
 CONNECTION is the current connection.  MESSAGE is a JSON-like
 plist.  TYPE is a symbol saying if this is a client or server
 originated."
   (let ((max (jsonrpc--events-buffer-scrollback-size connection)))
-    (when (or (null max) (cl-plusp max))
-      (with-current-buffer (jsonrpc-events-buffer connection)
-        (cl-destructuring-bind (&key method id error &allow-other-keys) message
-          (let* ((inhibit-read-only t)
-                 (subtype (cond ((and method id)       'request)
-                                (method                'notification)
-                                (id                    'reply)
-                                (t                     'message)))
-                 (type
-                  (concat (format "%s" (or type 'internal))
-                          (if type
-                              (format "-%s" subtype)))))
-            (goto-char (point-max))
-            (prog1
-                (let ((msg (format "[%s]%s%s %s:\n%s"
-                                   type
-                                   (if id (format " (id:%s)" id) "")
-                                   (if error " ERROR" "")
-                                   (current-time-string)
-                                   (pp-to-string message))))
-                  (when error
-                    (setq msg (propertize msg 'face 'error)))
-                  (insert-before-markers msg))
-              ;; Trim the buffer if it's too large
-              (when max
-                (save-excursion
-                  (goto-char (point-min))
-                  (while (> (buffer-size) max)
-                    (delete-region (point) (progn (forward-line 1)
-                                                  (forward-sexp 1)
-                                                  (forward-line 2)
-                                                  (point)))))))))))))
+    (unless jsonrpc-disable-logs
+      (when (or (null max) (cl-plusp max))
+        (with-current-buffer (jsonrpc-events-buffer connection)
+          (cl-destructuring-bind (&key method id error &allow-other-keys) message
+            (let* ((inhibit-read-only t)
+                   (subtype (cond ((and method id)       'request)
+                                  (method                'notification)
+                                  (id                    'reply)
+                                  (t                     'message)))
+                   (type
+                    (concat (format "%s" (or type 'internal))
+                            (if type
+                                (format "-%s" subtype)))))
+              (goto-char (point-max))
+              (prog1
+                  (let ((msg (format "[%s]%s%s %s:\n%s"
+                                     type
+                                     (if id (format " (id:%s)" id) "")
+                                     (if error " ERROR" "")
+                                     (current-time-string)
+                                     (pp-to-string message))))
+                    (when error
+                      (setq msg (propertize msg 'face 'error)))
+                    (insert-before-markers msg))
+                ;; Trim the buffer if it's too large
+                (when max
+                  (save-excursion
+                    (goto-char (point-min))
+                    (while (> (buffer-size) max)
+                      (delete-region (point) (progn (forward-line 1)
+                                                    (forward-sexp 1)
+                                                    (forward-line 2)
+                                                    (point))))))))))))))
 
 (provide 'jsonrpc)
 ;;; jsonrpc.el ends here
