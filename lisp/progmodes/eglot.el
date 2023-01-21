@@ -2425,18 +2425,21 @@ When called interactively, use the currently active server"
 
 (defun eglot--signal-textDocument/didOpen ()
   "Send textDocument/didOpen to server."
-  (setq eglot--recent-changes nil eglot--versioned-identifier 0)
-  (jsonrpc-notify
-   (eglot--current-server-or-lose)
-   :textDocument/didOpen `(:textDocument ,(eglot--TextDocumentItem))))
+  (when (and server (jsonrpc--process server) (process-live-p (jsonrpc--process server)))
+   (setq eglot--recent-changes nil eglot--versioned-identifier 0)
+   (jsonrpc-notify
+    (eglot--current-server-or-lose)
+    :textDocument/didOpen `(:textDocument ,(eglot--TextDocumentItem)))))
 
 (defun eglot--signal-textDocument/didClose ()
   "Send textDocument/didClose to server."
-  (with-demoted-errors
-      "[eglot] error sending textDocument/didClose: %s"
-    (jsonrpc-notify
-     (eglot--current-server-or-lose)
-     :textDocument/didClose `(:textDocument ,(eglot--TextDocumentIdentifier)))))
+  (let ((server (eglot-current-server)))
+    (when (and server (jsonrpc--process server) (process-live-p (jsonrpc--process server)))
+      (with-demoted-errors
+          "[eglot] error sending textDocument/didClose: %s"
+        (jsonrpc-notify
+         (eglot--current-server-or-lose)
+         :textDocument/didClose `(:textDocument ,(eglot--TextDocumentIdentifier)))))))
 
 (defun eglot--signal-textDocument/willSave ()
   "Send textDocument/willSave to server."
@@ -3314,6 +3317,12 @@ at point.  With prefix argument, prompt for ACTION-KIND."
                                  (length dirs-to-watch) (length watchers)))))
         (unless success
           (eglot-unregister-capability server method id))))))
+
+(cl-defmethod eglot-register-capability
+  (server (method (eql workspace/didChangeWorkspaceFolders)) id &key watchers)
+  "Handle dynamic registration of workspace/didChangeWatchedFiles."
+  ;; TODO: Implement this.
+  )
 
 (cl-defmethod eglot-unregister-capability
   (server (_method (eql workspace/didChangeWatchedFiles)) id)

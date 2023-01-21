@@ -428,10 +428,7 @@ nsxwidget_webkit_execute_script (struct xwidget *xw, const char *script,
     }
 
   NSString *javascriptString = [NSString stringWithUTF8String:script];
-  [xwWebView callAsyncJavaScript:javascriptString
-                       arguments: @{}.mutableCopy
-                         inFrame: nil
-                    contentWorld: WKContentWorld.defaultClientWorld
+  [xwWebView evaluateJavaScript:javascriptString
               completionHandler:^(id result, NSError *error) {
       if (error)
         {
