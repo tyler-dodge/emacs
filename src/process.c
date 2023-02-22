@@ -8088,16 +8088,6 @@ send_process (Lisp_Object proc, const char *buf, ptrdiff_t len,
 		/* This is a real error.  */
 		report_file_error ("Writing to process", proc);
 	    }
-	  if (!NETCONN1_P(p) && p->alive && process_output_consumer_fd_tracked_p(p->infd))
-	    {
-	      fd_set waiter;
-	      FD_ZERO(&waiter);
-	      FD_SET(process_writer_complete_write_fd, &waiter);
-	      struct timespec timeout;
-	      timeout = make_timespec (0, 100); //TODO: Make this longer once the complete fd is more granular.
-	      process_write_ready_fd_write(); // Ensures that the background thread knows this thread is waiting.
-	      pselect(process_writer_complete_write_fd + 1, &waiter, NULL, NULL, &timeout, NULL);
-	    }
 	  cur_buf += written;
 	  cur_len -= written;
 	}
