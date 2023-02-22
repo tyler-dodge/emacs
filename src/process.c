@@ -458,6 +458,8 @@ process_output_producer_thread_start(void * args)
   fd_set outputting_fds;
   fd_set tracked_fds;
   struct timespec no_timeout = make_timespec(0, 0);
+  struct timespec delay_timeout = make_timespec(0, 1000000);
+  bool after_delay = false;
 
   FD_ZERO(&ready_fds);
   FD_ZERO(&outputting_fds);
@@ -479,6 +481,7 @@ process_output_producer_thread_start(void * args)
       int maxFd = notify_fd;
       int readingCount = 0;
       bool has_output = false;
+      bool has_delay = false;
       while (buffer != NULL)
 	{
 	  if (buffer->completed || buffer->released)
@@ -501,7 +504,7 @@ process_output_producer_thread_start(void * args)
 		    }
 		  xfree((void *) buffer);
 		}
-	      else if (!buffer->ignored && (process_output_consumer_waiting_fd == -1 || buffer->fd == process_output_consumer_waiting_fd))
+	      else if (!buffer->ignored && (process_output_consumer_waiting_fd > 0 && buffer->fd == process_output_consumer_waiting_fd))
 		{
 		  has_output = true;
 		  process_output_producer_notification_fd_write();
@@ -528,12 +531,17 @@ process_output_producer_thread_start(void * args)
 	    }
 
 	  FD_SET(fd, &fds);
-	  if (FD_ISSET(fd, &ready_fds) || FD_ISSET(fd, &outputting_fds) || !FD_ISSET(fd, &tracked_fds))
+	  if (after_delay || FD_ISSET(fd, &ready_fds) || FD_ISSET(fd, &outputting_fds) || !FD_ISSET(fd, &tracked_fds))
 	    {
+	      const buffer_size = buffer->buffer_size;
 	      process_output_buffer_list_mutex_unlock();
 	      FD_SET(fd, &tracked_fds);
 	      updatedSize = emacs_read(fd, process_output_producer_copy_buffer, outputSize);
-
+	      const bool delay = buffer_size + updatedSize < 256;
+	      has_delay |= delay;
+	      if (delay) {
+		FD_CLR(fd, &fds);
+	      }
 	      if (updatedSize > 0)
 		{
 		  FD_SET(fd, &outputting_fds);
@@ -543,7 +551,7 @@ process_output_producer_thread_start(void * args)
 		  FD_CLR(fd, &outputting_fds);
 		}
 	      process_output_buffer_list_mutex_lock();
-	    }
+	   }
 	  else
 	    {
 	      updatedSize = -1;
@@ -598,9 +606,18 @@ process_output_producer_thread_start(void * args)
 
       process_output_buffer_list_mutex_unlock();
 
-      struct timespec * select_timeout = readingCount == 0 ? NULL : &no_timeout;
+      struct timespec * select_timeout;
+      if (has_delay)
+	{
+	  select_timeout = &delay_timeout;
+	}
+      else
+	{
+	  select_timeout = NULL;
+	}
 
-      pselect(maxFd + 1, &fds, NULL, NULL, select_timeout, NULL);
+      after_delay = pselect(maxFd + 1, &fds, NULL, NULL, select_timeout, NULL) == 0 && has_delay;
+
       memcpy(&ready_fds, &fds, sizeof(fd_set));
     }
   return NULL;
