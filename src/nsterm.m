@@ -10422,7 +10422,7 @@ nswindow_orderedIndex_sort (id w1, id w2, void *c)
    cache.  If no free surfaces are found in the cache then a new one
    is created.  */
 
-#define CACHE_MAX_SIZE 2
+#define CACHE_MAX_SIZE 16
 
 - (id) initWithColorSpace: (CGColorSpaceRef)cs
 {
@@ -10431,6 +10431,7 @@ nswindow_orderedIndex_sort (id w1, id w2, void *c)
   self = [super init];
   if (self)
     {
+      self.opaque = YES;
       cache = [[NSMutableArray arrayWithCapacity:CACHE_MAX_SIZE] retain];
       [self setColorSpace:cs];
     }
@@ -10543,6 +10544,7 @@ nswindow_orderedIndex_sort (id w1, id w2, void *c)
                 (id)kIOSurfaceHeight:[NSNumber numberWithInt:height],
                 (id)kIOSurfaceBytesPerRow:[NSNumber numberWithInt:bytesPerRow],
                 (id)kIOSurfaceBytesPerElement:[NSNumber numberWithInt:4],
+                (id)kIOSurfaceCacheMode: [NSNumber numberWithInt: kIOSurfaceWriteCombineCache],
                 (id)kIOSurfacePixelFormat:[NSNumber numberWithUnsignedInt:'BGRA']});
         }
 
