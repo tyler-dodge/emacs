@@ -1,5 +1,5 @@
-let pkgs = import <nixpkgs> {};
-
+{ pkgs ? (import <nixpkgs> {})}:
+let
     thread-list = list: start: pkgs.lib.lists.foldl (acc: item: (item acc)) start list;
 
     sdk_root = /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk;
@@ -52,7 +52,6 @@ mkdir -p $out/bin
 ln -s ${path} $out/bin/${name}
 '';
             in runCommandLocal "${name}-impure-darwin" {
-                    __impureHostDeps = [ path ];
                     meta = {
                             platforms = lib.platforms.darwin;
                     };
@@ -81,8 +80,7 @@ ln -s ${path} $out/bin/${name}
             pkgs.libtiff
             pkgs.lcms2
     ];
-in
-with pkgs; emacs.overrideAttrs (prevAttrs: {
+emacs = pkgs.emacs.overrideAttrs (prevAttrs: {
         version = "29";
 
         SDKROOT = impure_apple_sdk;
@@ -90,9 +88,7 @@ with pkgs; emacs.overrideAttrs (prevAttrs: {
         CC = pkgs.clang_15;
 
         preConfigure = ''
-# Manually overriding to get access to newer features and the nix version mismatches
-# the host.
-export MACOSX_DEPLOYMENT_TARGET="12.0"
+                    export MACOSX_DEPLOYMENT_TARGET="12.0"
 '';
 
         patches = (prevAttrs.patches) ++ [
@@ -117,4 +113,10 @@ export MACOSX_DEPLOYMENT_TARGET="12.0"
         nativeBuildInputs = (filter_apple_sdk prevAttrs.nativeBuildInputs) ++ extra_inputs;
 
         src = ./.;
-})
+});
+in {
+ inherit emacs;
+ runbook = pkgs.writeShellScript "org-runbook.sh" ''
+${emacs}/bin/emacsclient --eval "(message \"YOYO\")"
+'';
+}
