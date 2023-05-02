@@ -1,0 +1,8 @@
+* Nix Build :PTY:
+#+BEGIN_SRC compile-queue
+set -o errexit
+set -o pipefail
+set -o nounset
+cd {{project_root}}
+nix-build --show-trace
+#+END_SRC
