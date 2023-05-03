@@ -9077,6 +9077,10 @@ status_notify (struct Lisp_Process *deleting_process,
 	     So set p->update_tick again so that an error in the sentinel will
 	     not cause this code to be run again.  */
 	  p->update_tick = p->tick;
+
+	  /* Dump all remaining output before sending the sentinel */
+	  while (read_process_output(p, p->infd) > 0) {}
+
 	  /* Now output the message suitably.  */
 	  exec_sentinel (proc, msg);
 	  if (BUFFERP (p->buffer))
